@@ -28,6 +28,13 @@ var ProtocolLengths = []uint64{9}
 
 const (
 	ProtocolMaxMsgSize = 10 * 1024 * 1024 // Maximum cap on the size of a protocol message
+
+	// softResponseLimit is the target maximum cumulative size of a GetBlocks
+	// reply. The handler stops appending blocks once the encoded reply
+	// exceeds this limit, so a single request cannot force the node to
+	// read, encode, and attempt to send a reply that the transport's frame
+	// cap would reject anyway.
+	softResponseLimit = 2 * 1024 * 1024 // 2 MB, matching go-ethereum
 )
 
 // eth protocol message codes

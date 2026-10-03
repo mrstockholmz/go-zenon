@@ -202,6 +202,54 @@ func (pm *ProtocolManager) handle(p *peer) error {
 	}
 }
 
+// gatherBlocksForReply reads hashes from a GetBlocksMsg stream, deduplicates
+// them, and collects blocks until the count or reply-size limit is reached.
+// It returns the collected blocks and the total number of hashes read (before
+// dedup), for logging. The getBlock function is injected for testability.
+func gatherBlocksForReply(msgStream *rlp.Stream, getBlock func(types.Hash) *nom.DetailedMomentum) (blocks []*nom.DetailedMomentum, hashCount int, err error) {
+	var (
+		hash      types.Hash
+		seen      = make(map[types.Hash]struct{})
+		replySize int
+	)
+	for {
+		derr := msgStream.Decode(&hash)
+		if derr == rlp.EOL {
+			break
+		} else if derr != nil {
+			return nil, hashCount, errResp(ErrDecode, "getBlocks: %v", derr)
+		}
+		hashCount++
+
+		// Skip duplicates: each unique hash costs one store lookup, but
+		// repeating a hash must not multiply the reply payload (issue #124).
+		if _, dup := seen[hash]; dup {
+			continue
+		}
+		seen[hash] = struct{}{}
+
+		// Retrieve the requested block, stopping if enough was found
+		if block := getBlock(hash); block != nil {
+			encoded, encErr := rlp.EncodeToBytes(block)
+			if encErr != nil {
+				continue
+			}
+			// Include the block, then stop if the reply has grown past
+			// the soft limit. Appending before checking ensures at least
+			// one block is always returned, matching go-ethereum.
+			replySize += len(encoded)
+			blocks = append(blocks, block)
+			if replySize > softResponseLimit {
+				break
+			}
+			if len(blocks) >= downloader.MaxBlockFetch {
+				break
+			}
+		}
+	}
+	return blocks, hashCount, nil
+}
+
 // handleMsg is invoked whenever an inbound message is received from a remote
 // peer. The remote connection is torn down upon returning any error.
 func (pm *ProtocolManager) handleMsg(p *peer) error {
@@ -294,38 +342,12 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 		if _, err := msgStream.List(); err != nil {
 			return err
 		}
-		// Gather blocks until the fetch or network limits is reached
-		var (
-			hash   types.Hash
-			hashes []types.Hash
-			blocks []*nom.DetailedMomentum
-		)
-		for {
-			err := msgStream.Decode(&hash)
-			if err == rlp.EOL {
-				break
-			} else if err != nil {
-				return errResp(ErrDecode, "msg %v: %v", msg, err)
-			}
-			hashes = append(hashes, hash)
-
-			// Retrieve the requested block, stopping if enough was found
-			if block := pm.chainman.GetBlock(hash); block != nil {
-				blocks = append(blocks, block)
-				if len(blocks) >= downloader.MaxBlockFetch {
-					break
-				}
-			}
+		blocks, hashCount, err := gatherBlocksForReply(msgStream, pm.chainman.GetBlock)
+		if err != nil {
+			return err
 		}
-
-		if len(blocks) == 0 && len(hashes) > 0 {
-			list := "["
-			for _, hash := range hashes {
-				list += fmt.Sprintf("%x, ", hash[:4])
-			}
-			list = list[:len(list)-2] + "]"
-
-			log.Debug("no blocks found for requested hashes", "peer-id", p.id, "hashes", list)
+		if len(blocks) == 0 && hashCount > 0 {
+			log.Debug("no blocks found for requested hashes", "peer-id", p.id, "count", hashCount)
 		}
 		return p.SendBlocks(blocks)
 
