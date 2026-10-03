@@ -254,9 +254,10 @@ func TestAccountPool_higherPriorityUsesCachedDynamicPlasma(t *testing.T) {
 }
 
 // TestAccountPool_MomentumEventsRefreshDynamicPlasma verifies that
-// InsertMomentum and DeleteMomentum both refresh the pool's cached pricing
-// context by calling refreshDynamicPlasma, not just that higherPriority
-// consults the cache once it is populated.
+// InsertMomentum refreshes the pool's cached pricing context and
+// DeleteMomentum defers the refresh (dirty flag) so a batch rollback does
+// not pin the cache to a mid-rollback frontier. The deferred refresh fires
+// on the next higherPriority read.
 func TestAccountPool_MomentumEventsRefreshDynamicPlasma(t *testing.T) {
 	ap := newAccountPool(fakeStable{}) // nil store: any refresh must clear the cache
 	stale := dp.NewDynamicPlasma(&nom.Momentum{Version: 2, NextFusionPrice: 1000, NextWorkPrice: 1000}, &definition.PlasmaVariables{})
@@ -265,9 +266,19 @@ func TestAccountPool_MomentumEventsRefreshDynamicPlasma(t *testing.T) {
 	ap.InsertMomentum(&nom.DetailedMomentum{Momentum: &nom.Momentum{}})
 	common.Expect(t, ap.plasma == nil, true)
 
+	// DeleteMomentum marks the cache dirty instead of refreshing inline.
+	// The stale value remains until the next read or insert.
 	ap.plasma = stale
 	ap.DeleteMomentum(nil)
-	common.Expect(t, ap.plasma == nil, true)
+	common.Expect(t, ap.plasma == stale, true) // not yet refreshed
+	common.Expect(t, ap.plasmaDirty, true)
+
+	// The next higherPriority read triggers the deferred refresh.
+	a := &nom.AccountBlock{TotalPlasma: 100, BasePlasma: 100}
+	b := &nom.AccountBlock{TotalPlasma: 200, BasePlasma: 100}
+	_ = ap.higherPriority(a, b)
+	common.Expect(t, ap.plasma == nil, true) // refreshed (nil store)
+	common.Expect(t, ap.plasmaDirty, false)
 }
 
 // DeleteMomentum must only evict managers for addresses whose blocks were in

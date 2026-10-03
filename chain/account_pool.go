@@ -88,14 +88,22 @@ type accountPool struct {
 	// committed (or rolled-back) momentum rather than recomputed on every
 	// contested insert.
 	//
-	// plasmaMu guards the field alone: it is never held across a store
+	// plasmaDirty defers the rollback-side refresh: DeleteMomentum sets it
+	// instead of refreshing immediately, so a batch rollback of N momentums
+	// does not leave the cache pinned to a mid-rollback frontier between
+	// the first and last event. The next refresh (InsertMomentum or a
+	// higherPriority read) recomputes from the settled frontier and clears
+	// the flag.
+	//
+	// plasmaMu guards the fields alone: it is never held across a store
 	// read or across ap.changes, so it is a leaf lock. Every production
 	// writer (momentum insert/rollback) and reader (higherPriority) runs
 	// under chain.insert already, so plasmaMu is what keeps that invariant
 	// enforced rather than assumed — including for direct unit-test use of
 	// the pool, and for -race.
-	plasma   dp.DynamicPlasma
-	plasmaMu sync.Mutex
+	plasma      dp.DynamicPlasma
+	plasmaDirty bool
+	plasmaMu    sync.Mutex
 }
 
 func (ap *accountPool) getAccountManager(address types.Address) *accountManager {
@@ -178,6 +186,15 @@ func higherPricedBlock(plasma dp.DynamicPlasma, a, b *nom.AccountBlock) error {
 // content selection still uses the legacy TotalPlasma/BasePlasma ratio, so
 // that remains the fallback.
 func (ap *accountPool) higherPriority(a, b *nom.AccountBlock) error {
+	ap.plasmaMu.Lock()
+	dirty := ap.plasmaDirty
+	ap.plasmaMu.Unlock()
+	if dirty {
+		// A rollback batch completed since the last refresh; recompute
+		// from the settled frontier before ranking.
+		ap.refreshDynamicPlasma()
+	}
+
 	ap.plasmaMu.Lock()
 	plasma := ap.plasma
 	ap.plasmaMu.Unlock()
@@ -317,12 +334,14 @@ func (ap *accountPool) getFrontierAccountStore(address types.Address) store.Acco
 }
 
 // refreshDynamicPlasma recomputes the pricing context from the committed
-// frontier momentum. Called on every momentum insert and rollback, and
-// once at chain start-up.
+// frontier momentum and clears the dirty flag. Called on every momentum
+// insert, on the first pool read after a rollback batch, and once at
+// chain start-up.
 func (ap *accountPool) refreshDynamicPlasma() {
 	plasma := ap.computeDynamicPlasma()
 	ap.plasmaMu.Lock()
 	ap.plasma = plasma
+	ap.plasmaDirty = false
 	ap.plasmaMu.Unlock()
 }
 
@@ -370,7 +389,14 @@ func (ap *accountPool) InsertMomentum(detailed *nom.DetailedMomentum) {
 	}
 }
 func (ap *accountPool) DeleteMomentum(detailed *nom.DetailedMomentum) {
-	ap.refreshDynamicPlasma()
+	// Mark the pricing context stale instead of refreshing inline: during
+	// a batch rollback the frontier moves N times, and refreshing per event
+	// would pin the cache to a mid-rollback momentum. The next refresh
+	// (InsertMomentum or higherPriority) recomputes from the settled
+	// frontier.
+	ap.plasmaMu.Lock()
+	ap.plasmaDirty = true
+	ap.plasmaMu.Unlock()
 
 	ap.changes.Lock()
 	defer ap.changes.Unlock()
