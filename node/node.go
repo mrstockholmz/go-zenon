@@ -98,6 +98,12 @@ func NewNode(conf *Config) (*Node, error) {
 		return nil, fmt.Errorf("parse libp2p bootstrap peers: %w", err)
 	}
 
+	// Calculate libp2p listen address (separate port from legacy).
+	libp2pListenPort := netConfig.Libp2pListenPort
+	if libp2pListenPort == 0 {
+		libp2pListenPort = netConfig.ListenPort + 1
+	}
+
 	node.server = &switcher.Server{
 		PrivateKey:        netConfig.PrivateKey(),
 		Name:              netConfig.Name,
@@ -105,10 +111,10 @@ func NewNode(conf *Config) (*Node, error) {
 		MinConnectedPeers: netConfig.MinConnectedPeers,
 		MaxPendingPeers:   netConfig.MaxPendingPeers,
 		ListenAddr:        fmt.Sprintf("%v:%v", netConfig.ListenAddr, netConfig.ListenPort),
+		Libp2pListenAddr:  fmt.Sprintf("%v:%v", netConfig.ListenAddr, libp2pListenPort),
 		Protocols:         node.z.Protocol().SubProtocols,
 
-		// Per-backend bootstrap material — the switcher uses whichever
-		// matches the active backend at any given moment.
+		// Per-backend bootstrap material.
 		LegacyBootstrapNodes: legacyBootstrap,
 		NodeDatabase:         netConfig.NodeDatabase,
 		Libp2pBootstrapPeers: libp2pBootstrap,
@@ -117,7 +123,8 @@ func NewNode(conf *Config) (*Node, error) {
 
 		// Activation gate. The switcher polls this on a 1s ticker; when
 		// it returns true (the libp2p spork's EnforcementHeight has
-		// passed on this node's local chain) the swap fires.
+		// passed on this node's local chain) the legacy backend is
+		// retired (sunset), leaving libp2p as the sole transport.
 		Oracle: &sporkOracle{chain: node.z.Chain()},
 	}
 	return node, nil

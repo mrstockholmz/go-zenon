@@ -41,6 +41,10 @@ type NetConfig struct {
 	ListenHost string
 	ListenPort int
 
+	// Libp2pListenPort is the TCP port for the libp2p backend.
+	// When zero, defaults to ListenPort + 1.
+	Libp2pListenPort int
+
 	MinPeers          int
 	MinConnectedPeers int
 	MaxPeers          int
@@ -238,6 +242,7 @@ func (c *Config) makeNetConfig() *p2p.Net {
 		NodeDatabase:      networkDataDir,
 		ListenAddr:        c.Net.ListenHost,
 		ListenPort:        c.Net.ListenPort,
+		Libp2pListenPort:  c.Net.Libp2pListenPort,
 	}
 }
 func (c *Config) HTTPEndpoint() string {
