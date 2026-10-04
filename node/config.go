@@ -152,6 +152,11 @@ type NetConfig struct {
 	// network where no legacy peers remain (issue #105).
 	P2PBackend string
 
+	// Libp2pListenPort is the TCP port for the libp2p backend. When
+	// zero or omitted, it defaults to ListenPort + 1. Must differ from
+	// ListenPort so both backends can bind concurrently.
+	Libp2pListenPort int
+
 	MinPeers          int
 	MinConnectedPeers int
 	MaxPeers          int
@@ -337,6 +342,13 @@ func (c *Config) makeNetConfig() *p2p.Net {
 		peerstoreDir = *c.Net.PeerstoreDir
 	}
 
+	// Default the libp2p listen port to ListenPort + 1 when not
+	// explicitly configured.
+	libp2pListenPort := c.Net.Libp2pListenPort
+	if libp2pListenPort == 0 {
+		libp2pListenPort = c.Net.ListenPort + 1
+	}
+
 	return &p2p.Net{
 		PrivateKeyFile:    privateKeyFile,
 		MaxPeers:          c.Net.MaxPeers,
@@ -351,6 +363,7 @@ func (c *Config) makeNetConfig() *p2p.Net {
 		P2PBackend:        p2p.P2PBackend(c.Net.P2PBackend),
 		ListenAddr:        c.Net.ListenHost,
 		ListenPort:        c.Net.ListenPort,
+		Libp2pListenPort:  libp2pListenPort,
 	}
 }
 
