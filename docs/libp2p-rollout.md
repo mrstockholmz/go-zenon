@@ -4,6 +4,8 @@
 
 Replaces the custom devp2p/RLPX networking layer with [libp2p](https://libp2p.io/). The transition is **spork-gated**: every node ships a binary containing both transport stacks, runs on legacy until the libp2p activation spork's `EnforcementHeight` is reached on its local chain, then atomically swaps to libp2p in-process. No restart required by operators.
 
+A `Net.P2PBackend` config override (`auto` / `libp2p` / `legacy`) lets operators pin the transport explicitly. This is the safety net for the activation window: a node resyncing from a clean datadir after activation **must** set `P2PBackend: "libp2p"` — the default `auto` path starts legacy on a height-1 chain and can never reach the spork enforcement height if no legacy peers remain (issue #105).
+
 ---
 
 ## What Changed
@@ -217,6 +219,29 @@ Each operator's `config.json` carries both bootstrap formats. The legacy backend
 
 Existing operator configs that only have `Seeders` continue to boot — the libp2p backend falls back to `DefaultBootstrapPeers` when the field is omitted. `libp2p.ParseBootstrapPeers` tolerates accidentally-pasted `enode://` entries by skipping them with a warning.
 
+### Transport backend override (`Net.P2PBackend`)
+
+The `Net.P2PBackend` field controls which transport stack starts at boot time:
+
+| Value | Behaviour |
+|-------|-----------|
+| `"auto"` (default) | Spork-gated: legacy before activation, swap to libp2p at `EnforcementHeight`. |
+| `"libp2p"` | Start libp2p directly, skip the oracle and activation watcher. Use for resyncing from a clean datadir after the spork has activated. |
+| `"legacy"` | Start legacy and never swap. Use only if you explicitly need pre-spork behaviour. Logs a warning at startup. |
+
+Unknown values are rejected at startup before either backend opens a listener.
+
+**When to set `P2PBackend: "libp2p"`:**
+- Any resync from a clean (or deleted) datadir after the activation spork has enforced. The default `auto` path starts legacy on a height-1 chain; if no legacy peers remain on the network, the node can never sync the history needed to trigger its own swap — a bootstrap deadlock (issue #105).
+- A pillar that loses its database and must rejoin after activation.
+- Any node joining the network for the first time after activation.
+
+**Recovery procedure for a pillar that loses its database after activation:**
+1. Ensure `Net.BootstrapPeers` is populated with valid libp2p multiaddrs.
+2. Set `Net.P2PBackend` to `"libp2p"` in `config.json`.
+3. Start znnd. It will sync from genesis over libp2p without needing legacy peers.
+4. After sync completes and the node is healthy, the `P2PBackend` setting can be left as-is (it is the correct mode for a post-activation network) or removed to return to `auto`.
+
 ### Persistent peerstore
 
 The libp2p backend remembers peers across restarts via a LevelDB-backed peerstore at `<DataPath>/network/libp2p-peerstore/`. On every successful Zenon handshake, it records the peer's dialable multiaddrs, a last-seen timestamp, and a dial-failure count to disk (entries expire after 30 days unseen). On the next startup, a "warm bootstrap" path dials up to `MinConnectedPeers` of those known peers in parallel with the configured `BootstrapPeers` — so a node that has been online before can rejoin the network even if every bootstrap entry has since rotated. This is the primary safeguard against the failure mode that left the legacy network with 147 stale seeders: bootstrap nodes are now a first-time-setup dependency, not a continuous-availability dependency.
@@ -281,6 +306,8 @@ The spork holder broadcasts `ActivateSpork(<libp2p-spork-id>)`. The activation's
 
 At `EnforcementHeight`, every node's switcher polls its oracle, sees activation, and fires `swap()` within ~1s. Legacy backends are torn down; libp2p hosts come up on the same TCP port.
 
+**Nodes that are offline or resyncing during activation.** A node that was fully synced before going offline will, on restart, find the spork already active in its local chain history and start libp2p directly — no action needed. A node that was **not** fully synced before activation (or is resyncing from a clean datadir) starts legacy on a chain whose height is below `EnforcementHeight`. If no legacy peers remain on the network, it can never sync forward to trigger its own swap — a bootstrap deadlock. In that case, set `P2PBackend: "libp2p"` before starting (see issue #105). The `P2PBackend` override is the recovery path for this case.
+
 **Expected behaviour during the swap window.** Consensus does not pause for the transport transition — momentum production is chain-deterministic and fires on its tick schedule regardless of the local peer set. As a consequence:
 
 - The swap window is roughly the duration of `legacy.Stop()` + `libp2p.Start()`. On a healthy node with NAT mapping disabled this is well under a second; with UPnP/NAT-PMP enabled it can be several seconds.
@@ -314,6 +341,7 @@ For the first 24 hours, monitor:
 | Operator misses Phase D binary upgrade | **High** | ≥2 weeks public notice; pillar-coordination check-ins. A node on the placeholder binary stays on legacy forever — safe default but will partition off. |
 | libp2p bootstrap unavailability post-swap | **High** | Bootstrap operators upgrade first (they're a subset of pillar operators). Legacy bootstrap list is not a fallback — different transport. |
 | libp2p host fails to start during swap | **Medium** | Switcher logs `Crit` to `zenon.log`/`zenon.error.log` and retries with backoff, leaving RPC up. Operator can restart znnd; on restart the spork is active so libp2p starts directly. |
+| Fresh node cannot bootstrap after activation (no legacy peers remain) | **High** | Set `Net.P2PBackend: "libp2p"` in `config.json` before starting. This skips the spork oracle and starts libp2p directly, allowing sync from genesis over libp2p. See issue #105. |
 | Bootstrap-list staleness over time | **Medium** | Persistent peerstore (LevelDB at `<DataPath>/network/libp2p-peerstore/`) means once a node has been online it remembers ~`MinConnectedPeers` peers across restarts. Bootstrap entries become a first-time-setup dependency rather than a runtime dependency. Mitigates the "147 stale seeders" failure mode from the legacy network. |
 | Placeholder spork hash on mainnet | **Low** | Placeholder (`0x...01`) can't match any real `CreateSpork` hash. Node stays on legacy forever — safe default. Risk is operator confusion, not partition. |
 
@@ -327,7 +355,8 @@ For the first 24 hours, monitor:
 | DHT tuning for small network | **Done** | `ModeServer`, `/znn` prefix, `DisableProviders`/`DisableValues`, `BucketSize(16)`, `RefreshPeriod(1min)`, unconditional start |
 | Exponential backoff on bootstrap redial | **Done** | 5s base, 5m cap, ±30% jitter, reset on success. `p2p/libp2p/server.go:56-64` |
 | Switcher concurrency bugs | **Done** | Fixed: captured `stopCh` in watcher, nil-check before swap mutations, nil-oracle guard |
-| Switcher tests | **Done** | 5 lifecycle tests in `p2p/switcher/server_test.go` |
+| Switcher tests | **Done** | 21 lifecycle tests in `p2p/switcher/server_test.go` (including P2PBackend override paths) |
+| Transport backend override (`Net.P2PBackend`) | **Done** | #121 — `auto` (default), `libp2p`, `legacy` |
 | Persistent peerstore (go-ds-leveldb) | **Done** | LevelDB-backed peerstore at `<DataPath>/network/libp2p-peerstore/`. Warm-bootstrap on startup dials up to `MinConnectedPeers` known peers in parallel with `BootstrapPeers`. |
 
 ---
