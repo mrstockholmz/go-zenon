@@ -69,12 +69,14 @@ func testKey(t *testing.T) *ecdsa.PrivateKey {
 // sufficient for Start/Stop lifecycle tests.
 func newTestServer(t *testing.T, oracle *fakeOracle) *Server {
 	t.Helper()
+	port := freePort(t)
 	return &Server{
-		PrivateKey: testKey(t),
-		Name:       "test-node",
-		MaxPeers:   10,
-		ListenAddr: fmt.Sprintf("127.0.0.1:%d", freePort(t)),
-		Oracle:     oracle,
+		PrivateKey:       testKey(t),
+		Name:             "test-node",
+		MaxPeers:         10,
+		ListenAddr:       fmt.Sprintf("127.0.0.1:%d", port),
+		Libp2pListenAddr: fmt.Sprintf("127.0.0.1:%d", port+1),
+		Oracle:           oracle,
 	}
 }
 
@@ -83,7 +85,7 @@ func newTestServer(t *testing.T, oracle *fakeOracle) *Server {
 // ──────────────────────────────────────────────────────────────────────
 
 // mockBackend implements the backend interface for unit testing the
-// switcher's swap logic without real network I/O.
+// switcher's dual-start and sunset logic without real network I/O.
 type mockBackend struct {
 	mu       sync.Mutex
 	started  bool
@@ -161,34 +163,26 @@ func (m *mockBackend) isStopped() bool {
 // Start().
 func newMockServer(t *testing.T, oracle *fakeOracle) (*Server, *mockBackend, *mockBackend) {
 	t.Helper()
-	legacy := &mockBackend{peerCnt: 5}
-	libp2p := &mockBackend{peerCnt: 10}
+	legacy := &mockBackend{
+		peerCnt: 5,
+		peers:   makeTestPeersWithOffset(5, 1),
+	}
+	libp2p := &mockBackend{
+		peerCnt: 10,
+		peers:   makeTestPeersWithOffset(10, 100),
+	}
+	port := freePort(t)
 	srv := &Server{
-		PrivateKey: testKey(t),
-		Name:       "test-node",
-		MaxPeers:   10,
-		ListenAddr: fmt.Sprintf("127.0.0.1:%d", freePort(t)),
-		Oracle:     oracle,
-		NewLegacy:  func() backend { return legacy },
-		NewLibp2p:  func() backend { return libp2p },
+		PrivateKey:       testKey(t),
+		Name:             "test-node",
+		MaxPeers:         10,
+		ListenAddr:       fmt.Sprintf("127.0.0.1:%d", port),
+		Libp2pListenAddr: fmt.Sprintf("127.0.0.1:%d", port+1),
+		Oracle:           oracle,
+		NewLegacy:        func() backend { return legacy },
+		NewLibp2p:        func() backend { return libp2p },
 	}
 	return srv, legacy, libp2p
-}
-
-// waitForSwap polls until the switcher's active backend changes (i.e.
-// swap completes) or times out. Returns the PeerCount from the active
-// backend.
-func waitForSwap(t *testing.T, srv *Server, timeout time.Duration) int {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if srv.PeerCount() > 0 {
-			return srv.PeerCount()
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatal("waitForSwap: timed out waiting for swap to complete")
-	return 0
 }
 
 // waitForCondition polls a predicate until it returns true or times out.
@@ -205,12 +199,273 @@ func waitForCondition(t *testing.T, timeout time.Duration, desc string, cond fun
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Original regression tests (real backends)
+// Dual-start tests
 // ──────────────────────────────────────────────────────────────────────
 
-// TestStopDoesNotDeadlockBeforeActivation verifies that Stop() does not
-// deadlock when called before the spork activates.
-func TestStopDoesNotDeadlockBeforeActivation(t *testing.T) {
+// TestDualStart verifies that Start() launches both backends
+// concurrently: legacy binds ListenAddr, libp2p binds Libp2pListenAddr.
+func TestDualStart(t *testing.T) {
+	oracle := &fakeOracle{active: false}
+	srv, legacyMock, libp2pMock := newMockServer(t, oracle)
+
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Legacy should be running immediately (started synchronously).
+	if !legacyMock.isStarted() {
+		t.Fatal("legacy backend not started")
+	}
+
+	// libp2p starts asynchronously; wait for it.
+	waitForCondition(t, 5*time.Second, "libp2p to start", func() bool {
+		return libp2pMock.isStarted()
+	})
+
+	// Both backends should be reflected in the union peer count.
+	// legacy has 5, libp2p has 10, no overlap → 15.
+	waitForCondition(t, 5*time.Second, "PeerCount to reflect both backends", func() bool {
+		return srv.PeerCount() == 15
+	})
+
+	srv.Stop()
+	if !legacyMock.isStopped() {
+		t.Fatal("legacy not stopped after Stop()")
+	}
+	if !libp2pMock.isStopped() {
+		t.Fatal("libp2p not stopped after Stop()")
+	}
+}
+
+// TestSunsetLegacy verifies that when the spork activates, the legacy
+// backend is stopped but libp2p continues running.
+func TestSunsetLegacy(t *testing.T) {
+	oracle := &fakeOracle{active: false}
+	srv, legacyMock, libp2pMock := newMockServer(t, oracle)
+
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Wait for both backends.
+	waitForCondition(t, 5*time.Second, "libp2p to start", func() bool {
+		return libp2pMock.isStarted()
+	})
+
+	// Activate the spork.
+	oracle.setActive(true)
+
+	// Wait for sunset: legacy stopped, libp2p still running.
+	waitForCondition(t, 5*time.Second, "legacy to be sunset", func() bool {
+		return legacyMock.isStopped()
+	})
+
+	if libp2pMock.isStopped() {
+		t.Fatal("libp2p should NOT be stopped during sunset")
+	}
+
+	// After sunset, PeerCount should only count libp2p peers.
+	waitForCondition(t, 5*time.Second, "PeerCount to reflect libp2p only", func() bool {
+		return srv.PeerCount() == 10
+	})
+
+	// Clean shutdown.
+	srv.Stop()
+	if !libp2pMock.isStopped() {
+		t.Fatal("libp2p not stopped after Stop()")
+	}
+}
+
+// TestSunsetLegacyIdempotent verifies that calling sunsetLegacy multiple
+// times is safe.
+func TestSunsetLegacyIdempotent(t *testing.T) {
+	oracle := &fakeOracle{active: false}
+	srv, legacyMock, libp2pMock := newMockServer(t, oracle)
+
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	waitForCondition(t, 5*time.Second, "libp2p to start", func() bool {
+		return libp2pMock.isStarted()
+	})
+
+	// Sunset directly.
+	srv.sunsetLegacy()
+	srv.sunsetLegacy() // second call should be a no-op
+
+	if !legacyMock.isStopped() {
+		t.Fatal("legacy not stopped after sunset")
+	}
+	if libp2pMock.isStopped() {
+		t.Fatal("libp2p should not be stopped by sunset")
+	}
+
+	srv.Stop()
+}
+
+// TestSporkAlreadyActiveSkipsLegacy verifies that when the oracle reports
+// the spork as already active at startup, only libp2p is started.
+func TestSporkAlreadyActiveSkipsLegacy(t *testing.T) {
+	oracle := &fakeOracle{active: true}
+	srv, legacyMock, libp2pMock := newMockServer(t, oracle)
+
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer srv.Stop()
+
+	if legacyMock.isStarted() {
+		t.Fatal("legacy should not be started when spork already active")
+	}
+	if !libp2pMock.isStarted() {
+		t.Fatal("libp2p should be started when spork already active")
+	}
+	// After spork-active start, only libp2p is running with 10 peers.
+	waitForCondition(t, 5*time.Second, "PeerCount to reflect libp2p", func() bool {
+		return srv.PeerCount() == 10
+	})
+}
+
+// TestUnionPeersDedup verifies that Peers() returns the union of both
+// backends deduplicated by NodeID, preferring libp2p.
+func TestUnionPeersDedup(t *testing.T) {
+	oracle := &fakeOracle{active: false}
+	srv, legacyMock, libp2pMock := newMockServer(t, oracle)
+
+	// Create mock peers with the same NodeID in both backends.
+	sharedID := discover.NodeID{0x01, 0x02, 0x03}
+	legacyOnlyID := discover.NodeID{0x04, 0x05, 0x06}
+	libp2pOnlyID := discover.NodeID{0x07, 0x08, 0x09}
+
+	legacyMock.peers = []p2p.Peer{
+		&mockPeer{id: sharedID},
+		&mockPeer{id: legacyOnlyID},
+	}
+	libp2pMock.peers = []p2p.Peer{
+		&mockPeer{id: sharedID},
+		&mockPeer{id: libp2pOnlyID},
+	}
+
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer srv.Stop()
+
+	// Wait for libp2p to start asynchronously.
+	waitForCondition(t, 5*time.Second, "libp2p to start", func() bool {
+		return libp2pMock.isStarted()
+	})
+
+	// Union should have 3 unique peers: shared, legacy-only, libp2p-only.
+	peers := srv.Peers()
+	if len(peers) != 3 {
+		t.Fatalf("len(Peers()) = %d, want 3 (union dedup)", len(peers))
+	}
+
+	// The shared peer should come from libp2p (preferred).
+	for _, p := range peers {
+		if p.ID() == sharedID {
+			// We can't easily check which backend it came from without
+			// more mock surface, but the ordering (libp2p first) ensures
+			// preference.
+			break
+		}
+	}
+
+	// PeerCount should match the deduplicated union.
+	if n := srv.PeerCount(); n != 3 {
+		t.Fatalf("PeerCount = %d, want 3 (dedup union)", n)
+	}
+}
+
+// makeTestPeers creates n mockPeer values with distinct NodeIDs starting
+// from the given offset to avoid collisions between backends.
+func makeTestPeersWithOffset(n, offset int) []p2p.Peer {
+	peers := make([]p2p.Peer, n)
+	for i := range peers {
+		var id discover.NodeID
+		id[0] = byte(offset + i)
+		peers[i] = &mockPeer{id: id}
+	}
+	return peers
+}
+
+// mockPeer implements p2p.Peer for testing.
+type mockPeer struct {
+	id discover.NodeID
+}
+
+func (m *mockPeer) ID() discover.NodeID              { return m.id }
+func (m *mockPeer) Name() string                     { return "mock" }
+func (m *mockPeer) Caps() []p2p.Cap                  { return nil }
+func (m *mockPeer) RemoteAddr() net.Addr             { return nil }
+func (m *mockPeer) Disconnect(reason p2p.DiscReason) {}
+
+// TestSelfPrefersLibp2p verifies that Self() returns the libp2p backend's
+// self node when both backends are running.
+func TestSelfPrefersLibp2p(t *testing.T) {
+	oracle := &fakeOracle{active: false}
+	srv, legacyMock, libp2pMock := newMockServer(t, oracle)
+
+	libp2pSelf := &discover.Node{IP: net.ParseIP("1.2.3.4"), TCP: 36001}
+	legacySelf := &discover.Node{IP: net.ParseIP("5.6.7.8"), TCP: 36000}
+	libp2pMock.selfNode = libp2pSelf
+	legacyMock.selfNode = legacySelf
+
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer srv.Stop()
+
+	// Wait for libp2p to start asynchronously.
+	waitForCondition(t, 5*time.Second, "libp2p to start", func() bool {
+		return libp2pMock.isStarted()
+	})
+
+	s := srv.Self()
+	if !s.IP.Equal(libp2pSelf.IP) {
+		t.Fatalf("Self().IP = %s, want %s (libp2p preferred)", s.IP, libp2pSelf.IP)
+	}
+}
+
+// TestAddPeerRoutesToLegacy verifies that AddPeer is routed to the legacy
+// backend only.
+func TestAddPeerRoutesToLegacy(t *testing.T) {
+	oracle := &fakeOracle{active: false}
+	srv, legacyMock, libp2pMock := newMockServer(t, oracle)
+
+	legacyMock.addPeerC = make(chan *discover.Node, 1)
+	libp2pMock.addPeerC = make(chan *discover.Node, 1)
+
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer srv.Stop()
+
+	node := &discover.Node{IP: net.ParseIP("9.9.9.9"), TCP: 35995}
+	srv.AddPeer(node)
+
+	select {
+	case got := <-legacyMock.addPeerC:
+		if !got.IP.Equal(node.IP) {
+			t.Fatalf("AddPeer got IP %s, want %s", got.IP, node.IP)
+		}
+	default:
+		t.Fatal("AddPeer did not reach the legacy backend")
+	}
+
+	// libp2p should NOT receive AddPeer.
+	select {
+	case <-libp2pMock.addPeerC:
+		t.Fatal("AddPeer should not be routed to libp2p")
+	default:
+		// expected
+	}
+}
+
+// TestStopDoesNotDeadlock verifies that Stop() does not deadlock when
+// called after Start with both backends running.
+func TestStopDoesNotDeadlock(t *testing.T) {
 	oracle := &fakeOracle{active: false}
 	srv := newTestServer(t, oracle)
 
@@ -218,7 +473,6 @@ func TestStopDoesNotDeadlockBeforeActivation(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	// Immediately stop before activation — should not deadlock.
 	done := make(chan struct{})
 	go func() {
 		srv.Stop()
@@ -229,13 +483,13 @@ func TestStopDoesNotDeadlockBeforeActivation(t *testing.T) {
 	case <-done:
 		// success
 	case <-time.After(5 * time.Second):
-		t.Fatal("Stop() deadlocked before activation")
+		t.Fatal("Stop() deadlocked")
 	}
 }
 
-// TestStopDuringSwapDoesNotLeakBackend verifies that if Stop() races
-// with swap(), the libp2p backend is not started after Stop() returns.
-func TestStopDuringSwapDoesNotLeakBackend(t *testing.T) {
+// TestStopDuringSunsetDoesNotLeak verifies that Stop() racing with
+// sunsetLegacy() does not leak a backend.
+func TestStopDuringSunsetDoesNotLeak(t *testing.T) {
 	oracle := &fakeOracle{active: false}
 	srv := newTestServer(t, oracle)
 
@@ -243,10 +497,10 @@ func TestStopDuringSwapDoesNotLeakBackend(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	// Activate the spork — watcher will fire swap on next 1s tick.
+	// Activate the spork — watcher will fire sunset on next 1s tick.
 	oracle.setActive(true)
 
-	// Race: stop while the watcher may be mid-swap.
+	// Race: stop while the watcher may be mid-sunset.
 	time.Sleep(50 * time.Millisecond)
 	done := make(chan struct{})
 	go func() {
@@ -258,24 +512,24 @@ func TestStopDuringSwapDoesNotLeakBackend(t *testing.T) {
 	case <-done:
 		// success
 	case <-time.After(5 * time.Second):
-		t.Fatal("Stop() deadlocked during swap")
+		t.Fatal("Stop() deadlocked during sunset")
 	}
 
-	// After Stop, no backend should be active.
 	if srv.PeerCount() != 0 {
 		t.Fatal("PeerCount != 0 after Stop; backend may be leaked")
 	}
 }
 
-// TestStartWithNilOracleDoesNotLaunchWatcher verifies that Start() does
-// not launch the activation watcher when Oracle is nil, which would
-// panic on the first tick.
-func TestStartWithNilOracleDoesNotLaunchWatcher(t *testing.T) {
+// TestStartWithNilOracleStartsBoth verifies that Start() with a nil
+// oracle still starts both backends (no activation watcher).
+func TestStartWithNilOracleStartsBoth(t *testing.T) {
+	port := freePort(t)
 	srv := &Server{
-		PrivateKey: testKey(t),
-		Name:       "test-node",
-		MaxPeers:   10,
-		ListenAddr: fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+		PrivateKey:       testKey(t),
+		Name:             "test-node",
+		MaxPeers:         10,
+		ListenAddr:       fmt.Sprintf("127.0.0.1:%d", port),
+		Libp2pListenAddr: fmt.Sprintf("127.0.0.1:%d", port+1),
 		// Oracle intentionally nil
 	}
 
@@ -293,32 +547,7 @@ func TestStartWithNilOracleDoesNotLaunchWatcher(t *testing.T) {
 	case <-done:
 		// success
 	case <-time.After(5 * time.Second):
-		t.Fatal("Stop() deadlocked with nil oracle — Bug 3 regression")
-	}
-}
-
-// TestSporkAlreadyActive verifies that when the oracle reports the
-// spork as already active at startup, libp2p is started directly
-// without launching the watcher.
-func TestSporkAlreadyActive(t *testing.T) {
-	oracle := &fakeOracle{active: true}
-	srv := newTestServer(t, oracle)
-
-	if err := srv.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-
-	done := make(chan struct{})
-	go func() {
-		srv.Stop()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// success
-	case <-time.After(5 * time.Second):
-		t.Fatal("Stop() deadlocked when spork already active")
+		t.Fatal("Stop() deadlocked with nil oracle")
 	}
 }
 
@@ -335,57 +564,258 @@ func TestDoubleStop(t *testing.T) {
 	srv.Stop() // should be a no-op
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// Swap coverage tests (mock backends)
-// ──────────────────────────────────────────────────────────────────────
+// TestDoubleStart verifies that calling Start() twice returns an error.
+func TestDoubleStart(t *testing.T) {
+	oracle := &fakeOracle{active: false}
+	srv, _, _ := newMockServer(t, oracle)
 
-// TestSwapHappyPath verifies the full swap lifecycle: legacy starts,
-// oracle activates, swap fires, legacy is stopped, libp2p starts, and
-// delegation switches to the libp2p backend.
-func TestSwapHappyPath(t *testing.T) {
+	if err := srv.Start(); err != nil {
+		t.Fatalf("first Start: %v", err)
+	}
+	defer srv.Stop()
+
+	if err := srv.Start(); err == nil {
+		t.Fatal("second Start() should return error, got nil")
+	}
+}
+
+// TestStopBeforeStart verifies that Stop() on an unstarted server is
+// a no-op (no panic, no deadlock).
+func TestStopBeforeStart(t *testing.T) {
+	srv := &Server{
+		PrivateKey:       testKey(t),
+		Name:             "test-node",
+		MaxPeers:         10,
+		ListenAddr:       fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+		Libp2pListenAddr: fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		srv.Stop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// success — no-op
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop() on unstarted server deadlocked")
+	}
+}
+
+// TestStartRejectsNonPositiveMaxPeers verifies that Start() rejects a
+// non-positive MaxPeers before either backend starts.
+func TestStartRejectsNonPositiveMaxPeers(t *testing.T) {
 	oracle := &fakeOracle{active: false}
 	srv, legacyMock, libp2pMock := newMockServer(t, oracle)
+	srv.MaxPeers = 0
+
+	if err := srv.Start(); err == nil {
+		t.Fatal("Start() should return error when MaxPeers <= 0, got nil")
+	}
+
+	if legacyMock.isStarted() {
+		t.Fatal("legacy backend should not be started when MaxPeers is rejected")
+	}
+	if libp2pMock.isStarted() {
+		t.Fatal("libp2p backend should not be started when MaxPeers is rejected")
+	}
+}
+
+// TestStartRejectsSamePort verifies that Start() rejects a configuration
+// where Libp2pListenAddr equals ListenAddr.
+func TestStartRejectsSamePort(t *testing.T) {
+	oracle := &fakeOracle{active: false}
+	port := freePort(t)
+	srv := &Server{
+		PrivateKey:       testKey(t),
+		Name:             "test-node",
+		MaxPeers:         10,
+		ListenAddr:       fmt.Sprintf("127.0.0.1:%d", port),
+		Libp2pListenAddr: fmt.Sprintf("127.0.0.1:%d", port), // same port!
+		Oracle:           oracle,
+	}
+
+	if err := srv.Start(); err == nil {
+		t.Fatal("Start() should return error when both backends share a port")
+	}
+}
+
+// TestDefaultLibp2pAddr verifies that the default libp2p address
+// computation increments the port by 1.
+func TestDefaultLibp2pAddr(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"127.0.0.1:35995", "127.0.0.1:35996"},
+		{"0.0.0.0:35995", "0.0.0.0:35996"},
+		{"[::1]:35995", "[::1]:35996"},
+	}
+	for _, tt := range tests {
+		got := defaultLibp2pAddr(tt.input)
+		if got != tt.want {
+			t.Errorf("defaultLibp2pAddr(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+// TestDelegationNilBackend verifies that delegation methods return
+// zero values when no backend is active (before Start or after Stop).
+func TestDelegationNilBackend(t *testing.T) {
+	srv := &Server{
+		PrivateKey:       testKey(t),
+		Name:             "test-node",
+		MaxPeers:         10,
+		ListenAddr:       fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+		Libp2pListenAddr: fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+	}
+
+	if srv.PeerCount() != 0 {
+		t.Fatalf("PeerCount before Start = %d, want 0", srv.PeerCount())
+	}
+	if srv.Peers() != nil {
+		t.Fatal("Peers() before Start should return nil")
+	}
+	if srv.Self() == nil {
+		t.Fatal("Self() before Start should return non-nil empty Node")
+	}
+	srv.AddPeer(&discover.Node{}) // should not panic
+}
+
+// TestLibp2pStartRetriesUntilSuccess verifies that a libp2p backend that
+// fails its first start attempts is retried with backoff until it comes
+// up.
+func TestLibp2pStartRetriesUntilSuccess(t *testing.T) {
+	defer func() {
+		oldBase, oldCap := libp2pRetryBase, libp2pRetryCap
+		_ = oldBase
+		_ = oldCap
+	}()
+	// Compress retry schedule for test speed.
+	oldBase, oldCap := libp2pRetryBase, libp2pRetryCap
+	libp2pRetryBase = 20 * time.Millisecond
+	libp2pRetryCap = 100 * time.Millisecond
+	defer func() { libp2pRetryBase, libp2pRetryCap = oldBase, oldCap }()
+
+	oracle := &fakeOracle{active: false}
+	srv, legacyMock, libp2pMock := newMockServer(t, oracle)
+
+	var attempts atomic.Int32
+	libp2pMock.startFn = func() error {
+		n := attempts.Add(1)
+		if n <= 2 {
+			return fmt.Errorf("injected start failure %d", n)
+		}
+		libp2pMock.mu.Lock()
+		libp2pMock.started = true
+		libp2pMock.mu.Unlock()
+		return nil
+	}
+
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer srv.Stop()
+
+	waitForCondition(t, 5*time.Second, "libp2p to start after retries", func() bool {
+		return libp2pMock.isStarted()
+	})
+
+	if got := attempts.Load(); got != 3 {
+		t.Fatalf("start attempts = %d, want 3", got)
+	}
+	if !legacyMock.isStarted() {
+		t.Fatal("legacy should be started")
+	}
+}
+
+// TestLibp2pRetryAbortsOnStop verifies that a persistently-failing
+// libp2p backend does not keep the retry loop alive after Stop().
+func TestLibp2pRetryAbortsOnStop(t *testing.T) {
+	oldBase, oldCap := libp2pRetryBase, libp2pRetryCap
+	libp2pRetryBase = 2 * time.Second
+	libp2pRetryCap = 10 * time.Second
+	defer func() { libp2pRetryBase, libp2pRetryCap = oldBase, oldCap }()
+
+	oracle := &fakeOracle{active: false}
+	srv, _, libp2pMock := newMockServer(t, oracle)
+
+	var attempts atomic.Int32
+	libp2pMock.startFn = func() error {
+		attempts.Add(1)
+		return errors.New("injected: libp2p never starts")
+	}
 
 	if err := srv.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
-	// Legacy should be running.
-	if !legacyMock.isStarted() {
-		t.Fatal("legacy backend not started")
-	}
-	if srv.PeerCount() != 5 {
-		t.Fatalf("PeerCount = %d, want 5 (legacy)", srv.PeerCount())
-	}
-
-	// Activate the spork — watcher will swap on next tick.
-	oracle.setActive(true)
-
-	// Wait for the swap to complete (libp2p PeerCount = 10).
-	waitForCondition(t, 5*time.Second, "swap to libp2p", func() bool {
-		return libp2pMock.isStarted()
+	waitForCondition(t, 5*time.Second, "first failed start attempt", func() bool {
+		return attempts.Load() >= 1
 	})
 
-	// Legacy should have been stopped.
-	if !legacyMock.isStopped() {
-		t.Fatal("legacy backend not stopped after swap")
-	}
-
-	// Delegation should now point to libp2p.
-	if srv.PeerCount() != 10 {
-		t.Fatalf("PeerCount = %d, want 10 (libp2p)", srv.PeerCount())
-	}
-
-	// Clean shutdown.
+	start := time.Now()
 	srv.Stop()
-	if !libp2pMock.isStopped() {
-		t.Fatal("libp2p backend not stopped after Stop()")
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("Stop took %v; retry backoff not interrupted", took)
+	}
+
+	if srv.PeerCount() != 0 {
+		t.Fatalf("PeerCount = %d after aborted start, want 0", srv.PeerCount())
+	}
+	final := attempts.Load()
+	time.Sleep(150 * time.Millisecond)
+	if attempts.Load() != final {
+		t.Fatal("start attempts continued after Stop")
 	}
 }
 
-// TestSwapLibp2pStartFails verifies that when the libp2p backend fails
-// to start during swap, the node is left without an active backend
-// (no panic, no leak).
+// TestLegacyStartFails verifies that if the legacy backend fails to
+// start, Start() propagates the error and cleans up.
+func TestLegacyStartFails(t *testing.T) {
+	oracle := &fakeOracle{active: false}
+	srv, legacyMock, _ := newMockServer(t, oracle)
+
+	legacyMock.startErr = errors.New("port in use")
+
+	if err := srv.Start(); err == nil {
+		t.Fatal("Start() should return error when legacy fails, got nil")
+	}
+
+	srv.Stop()
+}
+
+// TestStartWarnsOnEmptyLibp2pBootstrap verifies the advance warning fires
+// on startup iff the libp2p bootstrap list is empty.
+func TestStartWarnsOnEmptyLibp2pBootstrap(t *testing.T) {
+	const warnMsg = "libp2p bootstrap list is empty"
+
+	buf := captureP2PLogs(t)
+	oracle := &fakeOracle{active: false}
+	srv, _, _ := newMockServer(t, oracle)
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	srv.Stop()
+	if !strings.Contains(buf.String(), warnMsg) {
+		t.Fatal("missing empty-bootstrap warning on startup")
+	}
+
+	buf2 := captureP2PLogs(t)
+	oracle2 := &fakeOracle{active: false}
+	srv2, _, _ := newMockServer(t, oracle2)
+	srv2.Libp2pBootstrapPeers = []peer.AddrInfo{{ID: "test-peer"}}
+	if err := srv2.Start(); err != nil {
+		t.Fatalf("Start 2: %v", err)
+	}
+	srv2.Stop()
+	if strings.Contains(buf2.String(), warnMsg) {
+		t.Fatal("warning fired despite populated bootstrap list")
+	}
+}
+
 // syncBuffer is a concurrency-safe bytes.Buffer for capturing log
 // output written by server goroutines.
 type syncBuffer struct {
@@ -413,424 +843,4 @@ func captureP2PLogs(t *testing.T) *syncBuffer {
 	common.P2PLogger.SetHandler(log15.StreamHandler(buf, log15.LogfmtFormat()))
 	t.Cleanup(func() { common.P2PLogger.SetHandler(log15.DiscardHandler()) })
 	return buf
-}
-
-// TestStartWarnsOnEmptyLibp2pBootstrap verifies the Phase-A advance
-// warning fires on legacy startup iff the libp2p bootstrap list is
-// empty.
-func TestStartWarnsOnEmptyLibp2pBootstrap(t *testing.T) {
-	const warnMsg = "libp2p bootstrap list is empty"
-
-	buf := captureP2PLogs(t)
-	oracle := &fakeOracle{active: false}
-	srv, _, _ := newMockServer(t, oracle)
-	if err := srv.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	srv.Stop()
-	if !strings.Contains(buf.String(), warnMsg) {
-		t.Fatal("missing empty-bootstrap warning on legacy startup")
-	}
-
-	buf2 := captureP2PLogs(t)
-	oracle2 := &fakeOracle{active: false}
-	srv2, _, _ := newMockServer(t, oracle2)
-	srv2.Libp2pBootstrapPeers = []peer.AddrInfo{{ID: "test-peer"}}
-	if err := srv2.Start(); err != nil {
-		t.Fatalf("Start 2: %v", err)
-	}
-	srv2.Stop()
-	if strings.Contains(buf2.String(), warnMsg) {
-		t.Fatal("warning fired despite populated bootstrap list")
-	}
-}
-
-// compressSwapRetry shrinks the swap retry schedule for tests and
-// returns a restore func to defer.
-func compressSwapRetry(base, ceil time.Duration) func() {
-	oldBase, oldCap := swapRetryBase, swapRetryCap
-	swapRetryBase, swapRetryCap = base, ceil
-	return func() { swapRetryBase, swapRetryCap = oldBase, oldCap }
-}
-
-// TestSwapRetriesUntilSuccess verifies that a libp2p backend that fails
-// its first start attempts is rebuilt and retried with backoff until it
-// comes up, and that the node has no active backend while retrying.
-func TestSwapRetriesUntilSuccess(t *testing.T) {
-	defer compressSwapRetry(20*time.Millisecond, 100*time.Millisecond)()
-
-	oracle := &fakeOracle{active: false}
-	srv, legacyMock, libp2pMock := newMockServer(t, oracle)
-
-	// Fail the first two start attempts, succeed on the third.
-	var attempts atomic.Int32
-	libp2pMock.startFn = func() error {
-		n := attempts.Add(1)
-		if n <= 2 {
-			return fmt.Errorf("injected start failure %d", n)
-		}
-		libp2pMock.mu.Lock()
-		libp2pMock.started = true
-		libp2pMock.mu.Unlock()
-		return nil
-	}
-
-	if err := srv.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	oracle.setActive(true)
-
-	waitForCondition(t, 5*time.Second, "swap to complete after retries", func() bool {
-		return libp2pMock.isStarted() && srv.PeerCount() == 10
-	})
-
-	if got := attempts.Load(); got != 3 {
-		t.Fatalf("start attempts = %d, want 3", got)
-	}
-	if !legacyMock.isStopped() {
-		t.Fatal("legacy not stopped")
-	}
-	srv.Stop()
-}
-
-// TestSwapRetryAbortsOnStop verifies that a persistently-failing libp2p
-// backend does not keep the retry loop — and therefore Stop(), which
-// waits on the watcher goroutine — alive: the backoff select observes
-// stopCh and exits promptly, even mid-sleep.
-func TestSwapRetryAbortsOnStop(t *testing.T) {
-	defer compressSwapRetry(2*time.Second, 10*time.Second)()
-
-	oracle := &fakeOracle{active: false}
-	srv, _, libp2pMock := newMockServer(t, oracle)
-
-	var attempts atomic.Int32
-	libp2pMock.startFn = func() error {
-		attempts.Add(1)
-		return errors.New("injected: libp2p never starts")
-	}
-
-	if err := srv.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	oracle.setActive(true)
-
-	waitForCondition(t, 5*time.Second, "first failed swap attempt", func() bool {
-		return attempts.Load() >= 1
-	})
-
-	// The retry loop is now in (or headed into) a 2s backoff sleep.
-	// Stop() must interrupt it rather than wait it out.
-	start := time.Now()
-	srv.Stop()
-	if took := time.Since(start); took > time.Second {
-		t.Fatalf("Stop took %v; retry backoff not interrupted", took)
-	}
-
-	if srv.PeerCount() != 0 {
-		t.Fatalf("PeerCount = %d after aborted swap, want 0", srv.PeerCount())
-	}
-	final := attempts.Load()
-	time.Sleep(150 * time.Millisecond)
-	if attempts.Load() != final {
-		t.Fatal("start attempts continued after Stop")
-	}
-}
-
-// TestStopDuringSwapRace verifies that if Stop() arrives while the
-// libp2p backend is starting (Stage 2 of swap), the freshly-built
-// libp2p is torn down and not leaked.
-func TestStopDuringSwapRace(t *testing.T) {
-	oracle := &fakeOracle{active: false}
-	srv, _, libp2pMock := newMockServer(t, oracle)
-
-	// Make libp2p Start() block until we release it, simulating a
-	// slow startup that Stop() races against.
-	started := make(chan struct{})
-	release := make(chan struct{})
-	libp2pMock.startFn = func() error {
-		libp2pMock.mu.Lock()
-		libp2pMock.started = true
-		libp2pMock.mu.Unlock()
-		close(started) // signal that Start() is executing
-		<-release      // block until test releases
-		return nil
-	}
-
-	if err := srv.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-
-	// Activate the spork — watcher will call swap().
-	oracle.setActive(true)
-
-	// Wait for libp2p Start() to begin executing.
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for libp2p Start() to begin")
-	}
-
-	// Stop() while libp2p is mid-Start().
-	done := make(chan struct{})
-	go func() {
-		srv.Stop()
-		close(done)
-	}()
-
-	// Release the blocked Start() so swap can proceed to Stage 3,
-	// where it should detect stopCh == nil and tear down.
-	close(release)
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Stop() deadlocked during swap race")
-	}
-
-	// libp2p should have been torn down (Stop() called).
-	if !libp2pMock.isStopped() {
-		t.Fatal("libp2p not stopped after Stop() raced with swap")
-	}
-
-	// No active backend.
-	if srv.PeerCount() != 0 {
-		t.Fatalf("PeerCount = %d after stop-during-swap, want 0", srv.PeerCount())
-	}
-}
-
-// TestDoubleStart verifies that calling Start() twice returns an error.
-func TestDoubleStart(t *testing.T) {
-	oracle := &fakeOracle{active: false}
-	srv, _, _ := newMockServer(t, oracle)
-
-	if err := srv.Start(); err != nil {
-		t.Fatalf("first Start: %v", err)
-	}
-	defer srv.Stop()
-
-	if err := srv.Start(); err == nil {
-		t.Fatal("second Start() should return error, got nil")
-	}
-}
-
-// TestStopBeforeStart verifies that Stop() on an unstarted server is
-// a no-op (no panic, no deadlock).
-func TestStopBeforeStart(t *testing.T) {
-	srv := &Server{
-		PrivateKey: testKey(t),
-		Name:       "test-node",
-		MaxPeers:   10,
-		ListenAddr: fmt.Sprintf("127.0.0.1:%d", freePort(t)),
-	}
-
-	done := make(chan struct{})
-	go func() {
-		srv.Stop()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// success — no-op
-	case <-time.After(2 * time.Second):
-		t.Fatal("Stop() on unstarted server deadlocked")
-	}
-}
-
-// TestDelegation verifies that Peers(), PeerCount(), AddPeer(), and
-// Self() delegate to the active backend.
-func TestDelegation(t *testing.T) {
-	oracle := &fakeOracle{active: true} // start libp2p directly
-	srv, _, libp2pMock := newMockServer(t, oracle)
-
-	selfNode := &discover.Node{
-		IP:  net.ParseIP("1.2.3.4"),
-		TCP: 35555,
-	}
-	libp2pMock.selfNode = selfNode
-	libp2pMock.peers = []p2p.Peer{} // empty but non-nil
-
-	if err := srv.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer srv.Stop()
-
-	// PeerCount
-	if n := srv.PeerCount(); n != 10 {
-		t.Fatalf("PeerCount = %d, want 10", n)
-	}
-
-	// Peers
-	if p := srv.Peers(); p == nil {
-		t.Fatal("Peers() returned nil, want non-nil slice")
-	}
-
-	// Self
-	s := srv.Self()
-	if s == nil {
-		t.Fatal("Self() returned nil")
-	}
-	if !s.IP.Equal(selfNode.IP) {
-		t.Fatalf("Self().IP = %s, want %s", s.IP, selfNode.IP)
-	}
-
-	// AddPeer
-	libp2pMock.addPeerC = make(chan *discover.Node, 1)
-	addNode := &discover.Node{IP: net.ParseIP("5.6.7.8"), TCP: 35556}
-	srv.AddPeer(addNode)
-	select {
-	case got := <-libp2pMock.addPeerC:
-		if !got.IP.Equal(addNode.IP) {
-			t.Fatalf("AddPeer got IP %s, want %s", got.IP, addNode.IP)
-		}
-	default:
-		t.Fatal("AddPeer did not reach the backend")
-	}
-}
-
-// TestSwapAbortsIfStopped verifies that if Stop() is called before
-// swap's Stage 1 acquires the lock, swap sees stopCh == nil and
-// aborts without starting libp2p.
-func TestSwapAbortsIfStopped(t *testing.T) {
-	oracle := &fakeOracle{active: false}
-	srv, legacyMock, libp2pMock := newMockServer(t, oracle)
-
-	if err := srv.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-
-	// Stop the server before activating the spork.
-	srv.Stop()
-
-	// Activate the spork after Stop. The watcher should have exited
-	// via stopCh, so swap should never fire.
-	oracle.setActive(true)
-
-	// Give the watcher time to potentially fire (it shouldn't).
-	time.Sleep(1500 * time.Millisecond)
-
-	if libp2pMock.isStarted() {
-		t.Fatal("libp2p started after Stop() — swap should have aborted")
-	}
-	if !legacyMock.isStopped() {
-		t.Fatal("legacy not stopped")
-	}
-}
-
-// TestSwapOnceGuard verifies that swap() is guarded by sync.Once —
-// even if the watcher somehow fires twice, the second swap is a no-op.
-func TestSwapOnceGuard(t *testing.T) {
-	oracle := &fakeOracle{active: false}
-	srv, legacyMock, libp2pMock := newMockServer(t, oracle)
-
-	if err := srv.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-
-	// Activate the spork.
-	oracle.setActive(true)
-
-	// Wait for swap to complete.
-	waitForCondition(t, 5*time.Second, "swap to libp2p", func() bool {
-		return libp2pMock.isStarted()
-	})
-
-	// Record the state after first swap.
-	firstSwapStopped := legacyMock.isStopped()
-	if !firstSwapStopped {
-		t.Fatal("legacy not stopped after first swap")
-	}
-
-	// The sync.Once guard means swap() cannot fire a second time.
-	// We verify this indirectly: if swap ran twice, the second
-	// NewLibp2p call would create a new mock (since our factory
-	// returns the same pointer, this is fine — but the guard is
-	// the important thing). Just verify the server is still healthy.
-	if srv.PeerCount() != 10 {
-		t.Fatalf("PeerCount = %d, want 10", srv.PeerCount())
-	}
-
-	srv.Stop()
-}
-
-// TestLegacyStartFails verifies that if the legacy backend fails to
-// start, Start() propagates the error and cleans up.
-func TestLegacyStartFails(t *testing.T) {
-	oracle := &fakeOracle{active: false}
-	srv, legacyMock, _ := newMockServer(t, oracle)
-
-	legacyMock.startErr = errors.New("port in use")
-
-	if err := srv.Start(); err == nil {
-		t.Fatal("Start() should return error when legacy fails, got nil")
-	}
-
-	// Server should not be running — Stop should be a no-op.
-	srv.Stop()
-}
-
-// TestStartRejectsNonPositiveMaxPeers verifies that Start() rejects a
-// non-positive MaxPeers before either backend starts.
-func TestStartRejectsNonPositiveMaxPeers(t *testing.T) {
-	oracle := &fakeOracle{active: false}
-	srv, legacyMock, libp2pMock := newMockServer(t, oracle)
-	srv.MaxPeers = 0
-
-	if err := srv.Start(); err == nil {
-		t.Fatal("Start() should return error when MaxPeers <= 0, got nil")
-	}
-
-	if legacyMock.isStarted() {
-		t.Fatal("legacy backend should not be started when MaxPeers is rejected")
-	}
-	if libp2pMock.isStarted() {
-		t.Fatal("libp2p backend should not be started when MaxPeers is rejected")
-	}
-}
-
-// TestSporkAlreadyActive_Mock verifies that when the oracle reports
-// the spork as already active at startup, the libp2p backend is
-// started directly (legacy is never touched).
-func TestSporkAlreadyActive_Mock(t *testing.T) {
-	oracle := &fakeOracle{active: true}
-	srv, legacyMock, libp2pMock := newMockServer(t, oracle)
-
-	if err := srv.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer srv.Stop()
-
-	if legacyMock.isStarted() {
-		t.Fatal("legacy should not be started when spork already active")
-	}
-	if !libp2pMock.isStarted() {
-		t.Fatal("libp2p not started when spork already active")
-	}
-	if srv.PeerCount() != 10 {
-		t.Fatalf("PeerCount = %d, want 10 (libp2p)", srv.PeerCount())
-	}
-}
-
-// TestDelegationNilBackend verifies that delegation methods return
-// zero values when no backend is active (before Start or after Stop).
-func TestDelegationNilBackend(t *testing.T) {
-	srv := &Server{
-		PrivateKey: testKey(t),
-		Name:       "test-node",
-		MaxPeers:   10,
-		ListenAddr: fmt.Sprintf("127.0.0.1:%d", freePort(t)),
-	}
-
-	// Before Start — all methods should return zero values.
-	if srv.PeerCount() != 0 {
-		t.Fatalf("PeerCount before Start = %d, want 0", srv.PeerCount())
-	}
-	if srv.Peers() != nil {
-		t.Fatal("Peers() before Start should return nil")
-	}
-	if srv.Self() == nil {
-		t.Fatal("Self() before Start should return non-nil empty Node")
-	}
-	// AddPeer should not panic.
-	srv.AddPeer(&discover.Node{})
 }

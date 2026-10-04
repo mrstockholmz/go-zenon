@@ -246,6 +246,11 @@ type Net struct {
 	// the server is started.
 	ListenAddr string
 	ListenPort int
+
+	// Libp2pListenPort is the TCP port for the libp2p backend. Must
+	// differ from ListenPort so both backends can bind concurrently.
+	// When zero, node/config.go defaults it to ListenPort + 1.
+	Libp2pListenPort int
 }
 
 // PrivateKey retrieves the currently configured private key of the node, checking

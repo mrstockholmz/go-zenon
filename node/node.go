@@ -105,6 +105,7 @@ func NewNode(conf *Config) (*Node, error) {
 		MinConnectedPeers: netConfig.MinConnectedPeers,
 		MaxPendingPeers:   netConfig.MaxPendingPeers,
 		ListenAddr:        fmt.Sprintf("%v:%v", netConfig.ListenAddr, netConfig.ListenPort),
+		Libp2pListenAddr:  fmt.Sprintf("%v:%v", netConfig.ListenAddr, netConfig.Libp2pListenPort),
 		Protocols:         node.z.Protocol().SubProtocols,
 
 		// Per-backend bootstrap material — the switcher uses whichever

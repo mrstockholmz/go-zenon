@@ -4,6 +4,7 @@ import (
 	"crypto/ecdsa"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
@@ -22,23 +23,25 @@ import (
 // a cached compare, so the cost is negligible.
 const sporkPollInterval = 1 * time.Second
 
-// swapRetryBase and swapRetryCap bound the exponential backoff between
-// libp2p start attempts during the swap. Every node in the network
-// swaps at the same EnforcementHeight, so a node whose libp2p startup
-// hits a transient failure (FD pressure, lingering socket from the
-// legacy teardown, slow NAT probe) must self-heal rather than sit
-// listener-less until an operator intervenes. Vars rather than consts
-// so tests can compress the schedule.
+// libp2pRetryBase and libp2pRetryCap bound the exponential backoff
+// between libp2p start attempts during initial Start(). A node whose
+// libp2p startup hits a transient failure (FD pressure, slow NAT probe)
+// must self-heal rather than sit without a libp2p listener until an
+// operator intervenes. Vars rather than consts so tests can compress
+// the schedule.
 var (
-	swapRetryBase = 1 * time.Second
-	swapRetryCap  = 60 * time.Second
+	libp2pRetryBase = 1 * time.Second
+	libp2pRetryCap  = 60 * time.Second
 )
 
-// Server is the spork-gated p2p server. It owns exactly one transport
-// backend at any given time — the legacy (devp2p/RLPX) stack before
-// activation, the libp2p stack after — and atomically swaps when the
-// libp2p activation spork's EnforcementHeight is reached on the local
-// chain.
+// Server is the dual-transport p2p server. It starts both the legacy
+// (devp2p/RLPX) and libp2p backends at Start() time, on separate listen
+// ports. When the libp2p activation spork's EnforcementHeight is
+// reached on the local chain, the legacy backend is sunset (stopped)
+// and libp2p continues running. This ensures a fresh node can always
+// bootstrap from libp2p peers regardless of its local chain height,
+// fixing the bootstrap deadlock where a pre-spork node could never sync
+// the history needed to activate its own libp2p backend.
 //
 // Server implements p2p.Server so callers (node, rpc) hold it via the
 // interface and never reach the active backend directly.
@@ -51,8 +54,14 @@ type Server struct {
 	MaxPeers          int // must be > 0; Start() rejects anything else
 	MinConnectedPeers int
 	MaxPendingPeers   int
-	ListenAddr        string // "host:port"
+	ListenAddr        string // "host:port" for the legacy backend
 	Protocols         []p2p.Protocol
+
+	// Libp2pListenAddr is the listen address for the libp2p backend
+	// (e.g. "host:port"). Must differ from ListenAddr so both backends
+	// can bind concurrently. When empty, defaults to ListenAddr with
+	// port+1.
+	Libp2pListenAddr string
 
 	// ---- legacy backend config ----
 	LegacyBootstrapNodes []*discover.Node
@@ -86,13 +95,11 @@ type Server struct {
 	NewLibp2p func() backend
 
 	// ---- internal state (do not set from outside) ----
-	mu       sync.RWMutex
-	active   backend // currently-serving backend (nil when stopped or mid-swap)
-	legacy   backend // pre-activation backend (nil when stopped or not yet started)
-	libp2p   backend // post-activation backend (nil when stopped or not yet swapped)
-	swapOnce sync.Once
-	stopCh   chan struct{}
-	wg       sync.WaitGroup // tracks the activation watcher goroutine
+	mu     sync.RWMutex
+	legacy backend // legacy backend (nil when stopped or not yet started)
+	libp2p backend // libp2p backend (nil when stopped or not yet started)
+	stopCh chan struct{}
+	wg     sync.WaitGroup // tracks the activation watcher goroutine
 }
 
 // backend is the minimal API the switcher needs from each transport
@@ -109,13 +116,18 @@ type backend interface {
 
 // Start launches the server.
 //
-// The choice of backend is driven by the spork oracle:
-//   - If the oracle reports the libp2p spork as already active (e.g.
-//     a node syncing onto a chain where the swap happened in history),
-//     libp2p is started directly. The legacy backend is never spun up.
-//   - Otherwise the legacy backend is started and the activation
-//     watcher goroutine is launched. It polls the oracle on a 1s
-//     ticker; on the first true reading it triggers the swap.
+// Both backends are started unconditionally:
+//   - The legacy backend binds ListenAddr and serves pre-spork peers.
+//   - The libp2p backend binds Libp2pListenAddr (default: ListenAddr
+//     with port+1) and serves post-spork peers.
+//
+// This dual-start design ensures a fresh node can always bootstrap from
+// libp2p peers regardless of its local chain height. The spork oracle
+// is used only to determine when to sunset (stop) the legacy backend.
+//
+// If the oracle reports the spork as already active at Start() time,
+// the legacy backend is skipped entirely — there is no pre-spork
+// history to serve on this chain.
 func (srv *Server) Start() error {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
@@ -123,17 +135,21 @@ func (srv *Server) Start() error {
 		return errors.New("switcher: server already started")
 	}
 
-	// Both backends treat this as a hard capacity bound and the libp2p
-	// backend's every capacity check is len(peerMap) >= MaxPeers, so a
-	// non-positive value means "accept nothing". Reject it here, before
-	// either backend starts, rather than at the spork swap — by then the
-	// legacy backend is already down and a start failure would leave the
-	// node with no listener.
 	if srv.MaxPeers <= 0 {
 		return fmt.Errorf("switcher: MaxPeers must be > 0 (got %d)", srv.MaxPeers)
 	}
 
 	srv.stopCh = make(chan struct{})
+
+	// Default Libp2pListenAddr to ListenAddr with port+1.
+	if srv.Libp2pListenAddr == "" {
+		srv.Libp2pListenAddr = defaultLibp2pAddr(srv.ListenAddr)
+	}
+
+	// Validate that the two backends will not collide on the same port.
+	if srv.Libp2pListenAddr == srv.ListenAddr {
+		return fmt.Errorf("switcher: Libp2pListenAddr %q must differ from ListenAddr %q", srv.Libp2pListenAddr, srv.ListenAddr)
+	}
 
 	libp2pActive := false
 	if srv.Oracle != nil {
@@ -141,22 +157,26 @@ func (srv *Server) Start() error {
 	}
 
 	if libp2pActive {
-		common.P2PLogger.Info("libp2p spork already active on local chain; starting libp2p backend directly")
+		common.P2PLogger.Info("libp2p spork already active on local chain; starting libp2p backend only")
 		return srv.startLibp2pLocked()
 	}
 
-	common.P2PLogger.Info("libp2p spork not active; starting legacy (devp2p/RLPX) backend")
-	// Advance notice for operators still on an empty libp2p bootstrap
-	// list (normal during Phase A of the rollout, mandatory to fix
-	// before activation is scheduled). The libp2p backend repeats this
-	// louder — at Crit — if it actually starts with no bootstrap
-	// entries and no remembered peers.
+	common.P2PLogger.Info("starting both p2p backends (legacy + libp2p)")
 	if len(srv.Libp2pBootstrapPeers) == 0 {
-		common.P2PLogger.Warn("libp2p bootstrap list is empty; after the activation spork this node will rely on its peer database and inbound connections — populate Net.BootstrapPeers before activation is scheduled")
+		common.P2PLogger.Warn("libp2p bootstrap list is empty; this node will rely on its peer database and inbound connections — populate Net.BootstrapPeers before activation is scheduled")
 	}
+
+	// Start legacy first (it is the pre-spork default).
 	if err := srv.startLegacyLocked(); err != nil {
 		return err
 	}
+
+	// Start libp2p concurrently — its startup (DHT init, NAT probe) can
+	// take seconds and must not block legacy startup. Failures are
+	// retried with backoff in the background.
+	srv.wg.Add(1)
+	go srv.startLibp2pAsync()
+
 	if srv.Oracle != nil {
 		srv.wg.Add(1)
 		go srv.watchActivation()
@@ -166,14 +186,14 @@ func (srv *Server) Start() error {
 	return nil
 }
 
-// Stop terminates whichever backend is active and shuts down the
-// activation watcher. Safe to call before Start() (it's a no-op) and
-// safe to call multiple times (subsequent calls are no-ops).
+// Stop terminates both backends and shuts down the activation watcher.
+// Safe to call before Start() (it's a no-op) and safe to call multiple
+// times (subsequent calls are no-ops).
 //
-// The currently-active backend's Stop() is called outside the lock so
-// readers (Peers/PeerCount/RPC) aren't blocked for the duration of the
-// teardown. After Stop() returns, the switcher's active reference is
-// nil and all delegating methods return zero values.
+// Each backend's Stop() is called outside the lock so readers
+// (Peers/PeerCount/RPC) aren't blocked for the duration of the
+// teardown. After Stop() returns, both backend references are nil and
+// all delegating methods return zero values.
 func (srv *Server) Stop() {
 	srv.mu.Lock()
 	if srv.stopCh == nil {
@@ -186,7 +206,6 @@ func (srv *Server) Stop() {
 	libp2pSrv := srv.libp2p
 	srv.legacy = nil
 	srv.libp2p = nil
-	srv.active = nil
 	srv.mu.Unlock()
 
 	if legacySrv != nil {
@@ -198,45 +217,82 @@ func (srv *Server) Stop() {
 	srv.wg.Wait()
 }
 
-// activeBackend returns the currently-serving backend (or nil) under
-// an RLock. The caller must not hold the result past their critical
-// section since swap() can replace it concurrently.
-func (srv *Server) activeBackend() backend {
+// legacyBackend returns the legacy backend (or nil) under an RLock.
+func (srv *Server) legacyBackend() backend {
 	srv.mu.RLock()
 	defer srv.mu.RUnlock()
-	return srv.active
+	return srv.legacy
 }
 
-// Peers returns the currently-connected peers from the active backend.
-// Returns nil if the server is stopped or mid-swap.
+// libp2pBackend returns the libp2p backend (or nil) under an RLock.
+func (srv *Server) libp2pBackend() backend {
+	srv.mu.RLock()
+	defer srv.mu.RUnlock()
+	return srv.libp2p
+}
+
+// Peers returns the union of peers from both backends, deduplicated
+// by NodeID. When both backends have a peer with the same NodeID, the
+// libp2p peer is preferred. Returns nil if the server is stopped.
 func (srv *Server) Peers() []p2p.Peer {
-	if b := srv.activeBackend(); b != nil {
-		return b.Peers()
+	legacy := srv.legacyBackend()
+	libp2p := srv.libp2pBackend()
+
+	if legacy == nil && libp2p == nil {
+		return nil
 	}
-	return nil
+
+	seen := make(map[discover.NodeID]bool)
+	var result []p2p.Peer
+
+	// Collect libp2p peers first (preferred).
+	if libp2p != nil {
+		for _, p := range libp2p.Peers() {
+			id := p.ID()
+			if !seen[id] {
+				seen[id] = true
+				result = append(result, p)
+			}
+		}
+	}
+
+	// Add legacy peers not already seen.
+	if legacy != nil {
+		for _, p := range legacy.Peers() {
+			id := p.ID()
+			if !seen[id] {
+				seen[id] = true
+				result = append(result, p)
+			}
+		}
+	}
+
+	return result
 }
 
-// PeerCount returns the number of currently-connected peers. Returns 0
-// if the server is stopped or mid-swap.
+// PeerCount returns the number of unique peers across both backends,
+// deduplicated by NodeID. Returns 0 if the server is stopped.
 func (srv *Server) PeerCount() int {
-	if b := srv.activeBackend(); b != nil {
-		return b.PeerCount()
-	}
-	return 0
+	return len(srv.Peers())
 }
 
-// AddPeer requests the active backend to dial and maintain a connection
-// to the given node. Discarded if the server is stopped or mid-swap.
+// AddPeer requests the legacy backend to dial and maintain a
+// connection to the given node. Discarded if the server is stopped.
+// (libp2p uses multiaddr bootstrap, not AddPeer.)
 func (srv *Server) AddPeer(node *discover.Node) {
-	if b := srv.activeBackend(); b != nil {
+	if b := srv.legacyBackend(); b != nil {
 		b.AddPeer(node)
 	}
 }
 
-// Self returns the local node's endpoint information from the active
-// backend, or an empty Node if the server is stopped or mid-swap.
+// Self returns the local node's endpoint information, preferring the
+// libp2p backend and falling back to legacy. Returns an empty Node if
+// the server is stopped.
 func (srv *Server) Self() *discover.Node {
-	if b := srv.activeBackend(); b != nil {
+	if b := srv.libp2pBackend(); b != nil {
+		return b.Self()
+	}
+	if b := srv.legacyBackend(); b != nil {
 		return b.Self()
 	}
 	return &discover.Node{}
@@ -265,15 +321,76 @@ func (srv *Server) startLegacyLocked() error {
 		srv.legacy = nil
 		return fmt.Errorf("switcher: start legacy backend: %w", err)
 	}
-	srv.active = srv.legacy
+	return nil
+}
+
+// startLibp2pAsync starts the libp2p backend in the background with
+// retry-on-failure. It is called as a goroutine from Start(). The
+// first start attempt happens immediately; subsequent attempts use
+// exponential backoff.
+func (srv *Server) startLibp2pAsync() {
+	defer srv.wg.Done()
+
+	srv.mu.RLock()
+	stopCh := srv.stopCh
+	srv.mu.RUnlock()
+	if stopCh == nil {
+		return
+	}
+
+	delay := libp2pRetryBase
+	for attempt := 1; ; attempt++ {
+		if err := srv.tryStartLibp2p(); err == nil {
+			if attempt > 1 {
+				common.P2PLogger.Info("libp2p backend started after retries", "attempts", attempt)
+			}
+			return
+		} else {
+			common.P2PLogger.Crit("failed to start libp2p backend; will retry",
+				"err", err, "attempt", attempt, "next-retry", delay)
+		}
+
+		select {
+		case <-stopCh:
+			return
+		case <-time.After(delay):
+		}
+		delay *= 2
+		if delay > libp2pRetryCap {
+			delay = libp2pRetryCap
+		}
+	}
+}
+
+// tryStartLibp2p constructs and starts the libp2p backend. Returns nil
+// on success. On failure, cleans up the partially-started backend.
+func (srv *Server) tryStartLibp2p() error {
+	srv.mu.Lock()
+	if srv.stopCh == nil {
+		srv.mu.Unlock()
+		return errors.New("switcher: stopped")
+	}
+	if srv.NewLibp2p != nil {
+		srv.libp2p = srv.NewLibp2p()
+	} else {
+		srv.libp2p = srv.buildLibp2p()
+	}
+	backend := srv.libp2p
+	srv.mu.Unlock()
+
+	if err := backend.Start(); err != nil {
+		backend.Stop()
+		srv.mu.Lock()
+		srv.libp2p = nil
+		srv.mu.Unlock()
+		return fmt.Errorf("switcher: start libp2p backend: %w", err)
+	}
 	return nil
 }
 
 // startLibp2pLocked constructs and starts the libp2p backend. Caller
-// must hold srv.mu. Only used at Start() time when there is no RPC
-// caller to block — the swap() path uses buildLibp2p + Start outside
-// the lock to avoid blocking concurrent Peers/PeerCount/AddPeer
-// readers during libp2p initialization.
+// must hold srv.mu. Used at Start() time when the spork is already
+// active and only libp2p is needed.
 func (srv *Server) startLibp2pLocked() error {
 	if srv.NewLibp2p != nil {
 		srv.libp2p = srv.NewLibp2p()
@@ -284,15 +401,12 @@ func (srv *Server) startLibp2pLocked() error {
 		srv.libp2p = nil
 		return fmt.Errorf("switcher: start libp2p backend: %w", err)
 	}
-	srv.active = srv.libp2p
 	return nil
 }
 
 // buildLibp2p constructs a *libp2p.Server from the switcher's
 // configuration without starting it. Pure — no locks, no I/O, no field
-// reads on srv beyond the immutable-after-Start config fields. Used by
-// the swap() path so libp2p.New() / DHT init / NAT probe time happens
-// outside the switcher mutex.
+// reads on srv beyond the immutable-after-Start config fields.
 func (srv *Server) buildLibp2p() *libp2p.Server {
 	return &libp2p.Server{
 		PrivateKey:        srv.PrivateKey,
@@ -305,34 +419,45 @@ func (srv *Server) buildLibp2p() *libp2p.Server {
 		BootstrapPeers:    srv.Libp2pBootstrapPeers,
 		NATPortMap:        srv.NATPortMap,
 		PeerstoreDir:      srv.PeerstoreDir,
-		ListenAddr:        srv.ListenAddr,
+		ListenAddr:        srv.Libp2pListenAddr,
 		Protocols:         srv.Protocols,
 	}
 }
 
-// swapFailed logs a structured record when a libp2p start attempt fails
-// during the swap. The caller retries with backoff, so the message
-// tells the operator the node is self-healing — but at Crit level
-// because a node with no listener is degraded and recurring attempts
-// are worth an alert.
-func (srv *Server) swapFailed(err error, attempt int, nextRetry time.Duration) {
-	common.P2PLogger.Crit("failed to start libp2p backend during swap; node has no active network listener; will retry",
-		"err", err, "attempt", attempt, "next-retry", nextRetry)
+// defaultLibp2pAddr returns the default libp2p listen address given
+// the legacy ListenAddr. It increments the port by 1.
+func defaultLibp2pAddr(listenAddr string) string {
+	_, port, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		// If we can't parse, return as-is; the backend will fail to start
+		// and the retry loop will log it.
+		return listenAddr
+	}
+	var p int
+	fmt.Sscanf(port, "%d", &p)
+	return net.JoinHostPort(mustHost(listenAddr), fmt.Sprintf("%d", p+1))
+}
+
+// mustHost extracts the host part from a host:port string.
+func mustHost(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	return host
 }
 
 // watchActivation polls the spork oracle until either the spork
-// activates (triggering swap()) or Stop() is called.
+// activates (triggering sunsetLegacy()) or Stop() is called.
 //
-// The polling cadence is sub-second so the swap fires well within a
-// single momentum slot once the chain crosses EnforcementHeight. The
-// check itself is cheap (one map lookup against cached frontier state),
+// The polling cadence is 1s so the sunset fires well within a single
+// momentum slot once the chain crosses EnforcementHeight. The check
+// itself is cheap (one map lookup against cached frontier state),
 // so polling rather than wiring into a momentum-event bus keeps the
 // switcher decoupled from the chain package.
 func (srv *Server) watchActivation() {
 	defer srv.wg.Done()
 
-	// Capture stopCh once so we never read a nil channel (which blocks
-	// forever) if Stop() closes and nils srv.stopCh while we're waiting.
 	srv.mu.RLock()
 	stopCh := srv.stopCh
 	srv.mu.RUnlock()
@@ -349,123 +474,35 @@ func (srv *Server) watchActivation() {
 			return
 		case <-ticker.C:
 			if srv.Oracle.IsLibp2pActive() {
-				srv.swap()
+				srv.sunsetLegacy()
 				return
 			}
 		}
 	}
 }
 
-// swap performs the atomic transition from the legacy backend to the
-// libp2p backend. Guarded by sync.Once so concurrent triggers (e.g. if
-// Stop and the activation tick race) cannot double-swap.
+// sunsetLegacy stops the legacy backend when the libp2p activation
+// spork fires. The libp2p backend (already running since Start())
+// continues serving. This replaces the old swap() which tore down
+// legacy and started libp2p atomically — a design that caused a
+// bootstrap deadlock for fresh nodes.
 //
-// Ordering: legacy is stopped (releasing the TCP listener port), then
-// libp2p is constructed and started on the same port. There is a brief
-// window — the duration of legacy.Stop() plus libp2p.Start() — during
-// which the switcher has no active backend; reads in that window
-// observe an empty peer set, which the protocol/handler layer tolerates
-// (it sees mass disconnect followed by mass reconnect, both of which
-// are normal transitions).
-//
-// The teardown and startup happen outside the mutex; only the brief
-// state transitions (publishing the new backend reference) are
-// performed under the lock. This keeps RPC readers responsive across
-// the swap — libp2p.New() can take several seconds on a slow NAT path
-// and we must not block Peers/PeerCount/Self/AddPeer callers for that
-// duration.
-//
-// If a libp2p start attempt fails it is retried with exponential
-// backoff (swapRetryBase doubling up to swapRetryCap) until it succeeds
-// or Stop() is called. Each failure logs at Crit so the operator
-// notices, but the node does not crash and needs no manual
-// intervention: the RPC stays up and the chain stays queryable
-// throughout. If the process is restarted instead, the spork is active
-// by then, so Start() goes directly to libp2p.
-func (srv *Server) swap() {
-	srv.swapOnce.Do(func() {
-		common.P2PLogger.Info("libp2p spork EnforcementHeight reached; swapping to libp2p backend")
-
-		// Stage 1: detach legacy from active state under the lock so
-		// concurrent reads stop seeing it. Stop the actual backend
-		// outside the lock since it can take a noticeable amount of
-		// time.
-		srv.mu.Lock()
-		if srv.stopCh == nil {
-			srv.mu.Unlock()
-			return // Stop() was called; abort the swap
-		}
-		// Captured for the retry loop below: Stop() nils srv.stopCh, and
-		// the backoff select must keep observing the channel that was
-		// closed rather than a nil field.
-		stopCh := srv.stopCh
-		legacySrv := srv.legacy
-		srv.legacy = nil
-		srv.active = nil
+// The sunset is idempotent: calling it multiple times is safe.
+func (srv *Server) sunsetLegacy() {
+	srv.mu.Lock()
+	if srv.stopCh == nil {
 		srv.mu.Unlock()
-
-		if legacySrv != nil {
-			legacySrv.Stop()
-		}
-
-		// Stage 2: construct and start the libp2p backend WITHOUT the
-		// switcher mutex held. libp2p.New() runs through transport
-		// setup, Noise key derivation, and (when enabled) UPnP/NAT-PMP
-		// probes — each of which can take observable wall time. If we
-		// did this under srv.mu, every Peers()/PeerCount()/Self()/
-		// AddPeer() RPC call would block for that duration.
-		// Startup is retried until it succeeds or Stop() is called. The
-		// backend is rebuilt fresh on every attempt: construction is
-		// cheap (no I/O — see buildLibp2p), and a fresh value avoids
-		// depending on every backend implementation (test stubs
-		// included) being safely re-startable after a failed Start().
-		var newBackend backend
-		delay := swapRetryBase
-		for attempt := 1; ; attempt++ {
-			if srv.NewLibp2p != nil {
-				newBackend = srv.NewLibp2p()
-			} else {
-				newBackend = srv.buildLibp2p()
-			}
-			err := newBackend.Start()
-			if err == nil {
-				if attempt > 1 {
-					common.P2PLogger.Info("libp2p backend started during swap after retries", "attempts", attempt)
-				}
-				break
-			}
-			srv.swapFailed(err, attempt, delay)
-
-			select {
-			case <-stopCh:
-				// Stop() was called during backoff. Start() returned an
-				// error above, but the backend may still have allocated
-				// resources (e.g. a partially-opened host) before failing;
-				// give it a chance to release them.
-				newBackend.Stop()
-				return
-			case <-time.After(delay):
-			}
-			delay *= 2
-			if delay > swapRetryCap {
-				delay = swapRetryCap
-			}
-		}
-
-		// Stage 3: publish the new backend under the lock. If Stop()
-		// arrived while libp2p was starting, tear the freshly-built
-		// backend down — Stop() can't have seen it (we hadn't written
-		// srv.libp2p yet), so it's our responsibility to clean up.
-		srv.mu.Lock()
-		if srv.stopCh == nil {
-			srv.mu.Unlock()
-			newBackend.Stop()
-			return
-		}
-		srv.libp2p = newBackend
-		srv.active = newBackend
+		return // already stopped
+	}
+	legacySrv := srv.legacy
+	if legacySrv == nil {
 		srv.mu.Unlock()
+		return // already sunset
+	}
+	srv.legacy = nil
+	srv.mu.Unlock()
 
-		common.P2PLogger.Info("libp2p swap complete")
-	})
+	common.P2PLogger.Info("libp2p spork EnforcementHeight reached; sunsetting legacy backend")
+	legacySrv.Stop()
+	common.P2PLogger.Info("legacy backend sunset complete; libp2p continues")
 }
