@@ -2,6 +2,7 @@ package legacy
 
 import (
 	"bytes"
+	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
 	"errors"
@@ -10,12 +11,14 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/rlp"
 	"golang.org/x/crypto/sha3"
 
 	"github.com/zenon-network/go-zenon/p2p"
+	"github.com/zenon-network/go-zenon/p2p/discover"
 )
 
 // Message codes at both ends of the RLP encoding range. The code shares
@@ -343,103 +346,215 @@ func testSecrets(t *testing.T) (aesKey, macKey []byte) {
 	return aesKey, macKey
 }
 
-// TestFrameRWHandshakeBound verifies that during the handshake phase
-// (before raiseFrameLimit), WriteMsg rejects frames larger than
-// baseProtocolMaxMsgSize, and ReadMsg rejects oversized frame headers.
-func TestFrameRWHandshakeBound(t *testing.T) {
-	aesKey, macKey := testSecrets(t)
+// newHandshakePair returns two rlpx transports connected by a pipe, with
+// the encryption handshake already completed on both sides. The caller
+// drives the protocol handshake.
+func newHandshakePair(t *testing.T) (initiator, responder *rlpx) {
+	t.Helper()
 	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
+	prv1, _ := crypto.GenerateKey()
+	prv2, _ := crypto.GenerateKey()
 
-	reader := newRLPXFrameRW(c1, secrets{
-		AES:        aesKey,
-		MAC:        macKey,
-		EgressMAC:  sha256.New(),
-		IngressMAC: sha256.New(),
-	})
+	initiator = newRLPX(c1).(*rlpx)
+	responder = newRLPX(c2).(*rlpx)
 
-	// Write path: a frame larger than baseProtocolMaxMsgSize must be rejected.
-	largePayload := make([]byte, baseProtocolMaxMsgSize+100)
-	msg := p2p.Msg{
-		Code:    0x10,
-		Size:    uint32(len(largePayload)),
-		Payload: bytesReader(largePayload),
-	}
-	err := reader.WriteMsg(msg)
-	if err == nil {
-		t.Error("expected WriteMsg to reject oversized frame during handshake phase")
-	} else {
-		t.Logf("WriteMsg correctly rejected: %v", err)
+	node2 := &discover.Node{
+		ID:  discover.PubkeyID(&prv2.PublicKey),
+		IP:  net.ParseIP("127.0.0.1"),
+		UDP: 30304,
+		TCP: 30304,
 	}
 
-	// Read path: create a writer-side frame RW with independent MAC instances
-	// (same initial state, but not shared — each side evolves its own).
-	writer := newRLPXFrameRW(c2, secrets{
-		AES:        aesKey,
-		MAC:        macKey,
-		EgressMAC:  sha256.New(),
-		IngressMAC: sha256.New(),
-	})
-
+	errCh := make(chan error, 2)
 	go func() {
-		writeOversizedFrame(t, writer, baseProtocolMaxMsgSize+100)
+		_, err := initiator.doEncHandshake(prv1, node2)
+		errCh <- err
 	}()
+	go func() {
+		_, err := responder.doEncHandshake(prv2, nil)
+		errCh <- err
+	}()
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("enc handshake: %v", err)
+		}
+	}
+	return initiator, responder
+}
 
-	_, err = reader.ReadMsg()
-	if err == nil {
-		t.Error("expected ReadMsg to reject oversized frame during handshake phase")
-	} else {
-		t.Logf("ReadMsg correctly rejected: %v", err)
+// protoHandshakeMsg returns a valid protocol handshake for the given key.
+func protoHandshakeMsg(prv *ecdsa.PrivateKey) *protoHandshake {
+	return &protoHandshake{
+		Version: baseProtocolVersion,
+		Name:    "test",
+		ID:      discover.PubkeyID(&prv.PublicKey),
 	}
 }
 
-// TestFrameRWPostHandshakeBound verifies that after raiseFrameLimit(),
-// the frame reader accepts frames larger than baseProtocolMaxMsgSize.
-func TestFrameRWPostHandshakeBound(t *testing.T) {
-	aesKey, macKey := testSecrets(t)
-	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
+// TestHandshakeBoundRejectsOversizedHeader verifies that during the
+// handshake phase (before raiseFrameLimit), an authenticated frame header
+// announcing more than baseProtocolMaxMsgSize is rejected before any body
+// read.
+func TestHandshakeBoundRejectsOversizedHeader(t *testing.T) {
+	initiator, responder := newHandshakePair(t)
+	defer initiator.fd.Close()
+	defer responder.fd.Close()
 
-	writer := newRLPXFrameRW(c1, secrets{
-		AES:        aesKey,
-		MAC:        macKey,
-		EgressMAC:  sha256.New(),
-		IngressMAC: sha256.New(),
-	})
-	reader := newRLPXFrameRW(c2, secrets{
-		AES:        aesKey,
-		MAC:        macKey,
-		EgressMAC:  sha256.New(),
-		IngressMAC: sha256.New(),
-	})
-	writer.raiseFrameLimit()
-	reader.raiseFrameLimit()
+	// The responder's frame RW is still in handshake phase. Send an
+	// authenticated oversized header from the initiator.
+	go func() {
+		writeOversizedFrame(t, initiator.rw, baseProtocolMaxMsgSize+100)
+	}()
 
-	// Write a frame larger than 2 KiB but smaller than 10 MiB.
-	payload := make([]byte, 4096) // 4 KiB > 2 KiB handshake bound
+	_, err := responder.ReadMsg()
+	if err == nil {
+		t.Fatal("expected ReadMsg to reject oversized frame during handshake phase")
+	}
+	if !strings.Contains(err.Error(), "frame size") {
+		t.Fatalf("expected frame size error, got: %v", err)
+	}
+}
+
+// TestProtoHandshakePromotesFrameLimit verifies the production transition:
+// after doProtoHandshake succeeds on both sides, a frame larger than the
+// handshake bound (2 KiB) but within the steady-state bound is accepted.
+func TestProtoHandshakePromotesFrameLimit(t *testing.T) {
+	prv1, _ := crypto.GenerateKey()
+	prv2, _ := crypto.GenerateKey()
+	initiator, responder := newHandshakePair(t)
+	defer initiator.fd.Close()
+	defer responder.fd.Close()
+
+	// Run the protocol handshake on both sides concurrently.
+	errCh := make(chan error, 2)
+	go func() {
+		_, err := initiator.doProtoHandshake(protoHandshakeMsg(prv1))
+		errCh <- err
+	}()
+	go func() {
+		_, err := responder.doProtoHandshake(protoHandshakeMsg(prv2))
+		errCh <- err
+	}()
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("proto handshake: %v", err)
+		}
+	}
+
+	// Simulate what setupConn does: promote the frame limit after the
+	// handshake and identity checks succeed.
+	initiator.raiseFrameLimit()
+	responder.raiseFrameLimit()
+
+	// Now a frame larger than 2 KiB but smaller than 10 MiB must succeed.
+	payload := payloadOf(4096) // 4 KiB > 2 KiB handshake bound
 	msg := p2p.Msg{
 		Code:    0x10,
 		Size:    uint32(len(payload)),
 		Payload: bytesReader(payload),
 	}
 
-	errCh := make(chan error, 1)
+	writeErr := make(chan error, 1)
 	go func() {
-		errCh <- writer.WriteMsg(msg)
+		writeErr <- initiator.WriteMsg(msg)
 	}()
 
-	got, err := reader.ReadMsg()
+	got, err := responder.ReadMsg()
 	if err != nil {
-		t.Fatalf("ReadMsg failed after raiseFrameLimit: %v", err)
+		t.Fatalf("ReadMsg failed after proto handshake: %v", err)
 	}
 	if got.Code != 0x10 {
 		t.Errorf("expected code 0x10, got 0x%x", got.Code)
 	}
-	if err := <-errCh; err != nil {
-		t.Errorf("WriteMsg failed after raiseFrameLimit: %v", err)
+	gotPayload, _ := io.ReadAll(got.Payload)
+	if !bytes.Equal(gotPayload, payload) {
+		t.Error("payload mismatch")
 	}
+	if err := <-writeErr; err != nil {
+		t.Errorf("WriteMsg failed after proto handshake: %v", err)
+	}
+}
+
+// TestHandshakeFailureNoPromotion verifies that when the protocol handshake
+// fails (remote sends disconnect), the frame limit is not promoted.
+func TestHandshakeFailureNoPromotion(t *testing.T) {
+	prv1, _ := crypto.GenerateKey()
+	initiator, responder := newHandshakePair(t)
+	defer initiator.fd.Close()
+	defer responder.fd.Close()
+
+	// The initiator sends a disconnect instead of a handshake.
+	go func() {
+		initiator.fd.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		p2p.SendItems(initiator.rw, discMsg, p2p.DiscTooManyPeers)
+	}()
+
+	_, err := responder.doProtoHandshake(protoHandshakeMsg(prv1))
+	if err == nil {
+		t.Fatal("expected proto handshake to fail on disconnect")
+	}
+
+	// Clear the handshake deadline so the frame RW operations below are
+	// not cut off by the pipe's earlier SetDeadline.
+	responder.fd.SetReadDeadline(time.Time{})
+	initiator.fd.SetWriteDeadline(time.Time{})
+
+	// The responder's frame RW must still be in handshake phase: an
+	// oversized header is still rejected.
+	go func() {
+		writeOversizedFrame(t, initiator.rw, baseProtocolMaxMsgSize+100)
+	}()
+	_, err = responder.ReadMsg()
+	if err == nil {
+		t.Fatal("expected ReadMsg to reject oversized frame after failed handshake")
+	}
+	if !strings.Contains(err.Error(), "frame size") {
+		t.Fatalf("expected frame size error, got: %v", err)
+	}
+}
+
+// TestHandshakeBoundWriteRejectsOversized verifies that during the
+// handshake phase, WriteMsg rejects frames larger than
+// baseProtocolMaxMsgSize.
+func TestHandshakeBoundWriteRejectsOversized(t *testing.T) {
+	_, responder := newHandshakePair(t)
+	defer responder.fd.Close()
+
+	largePayload := make([]byte, baseProtocolMaxMsgSize+100)
+	msg := p2p.Msg{
+		Code:    0x10,
+		Size:    uint32(len(largePayload)),
+		Payload: bytesReader(largePayload),
+	}
+	err := responder.WriteMsg(msg)
+	if err == nil {
+		t.Error("expected WriteMsg to reject oversized frame during handshake phase")
+	}
+}
+
+// TestWriteOverflowRejected verifies that the write-path frame-size
+// calculation is overflow-safe: a near-maximum uint32 Size does not wrap
+// and is rejected. After the rejection, a valid round-trip on the same
+// frame pair still works.
+func TestWriteOverflowRejected(t *testing.T) {
+	writer, reader, wire := newFramePair()
+
+	// Near-maximum uint32: uint32(len(ptype)) + msg.Size would wrap.
+	msg := p2p.Msg{
+		Code:    0x10,
+		Size:    ^uint32(0) - 1, // 0xFFFFFFFE, no large allocation needed
+		Payload: bytesReader(nil),
+	}
+	err := writer.WriteMsg(msg)
+	if err == nil {
+		t.Fatal("expected WriteMsg to reject near-maximum uint32 size")
+	}
+
+	// After the rejected write, a valid round-trip must still work.
+	wire.nextFrame()
+	payload := []byte("hello")
+	writeMsg(t, writer, 7, payload)
+	readMsg(t, reader, 7, payload)
 }
 
 // TestFrameRWWriteBoundAfterRaise verifies that even after raiseFrameLimit,
@@ -467,8 +582,6 @@ func TestFrameRWWriteBoundAfterRaise(t *testing.T) {
 	err := rw.WriteMsg(msg)
 	if err == nil {
 		t.Error("expected WriteMsg to reject frame above maxFrameSize")
-	} else {
-		t.Logf("WriteMsg correctly rejected: %v", err)
 	}
 }
 

@@ -148,10 +148,6 @@ func (t *rlpx) doProtoHandshake(our *protoHandshake) (their *protoHandshake, err
 	if err := <-werr; err != nil {
 		return nil, fmt.Errorf("write error: %v", err)
 	}
-	// Protocol handshake succeeded — raise the frame size limit from the
-	// handshake bound (2 KiB) to the steady-state bound (10 MiB) before
-	// the peer read loop starts.
-	t.rw.raiseFrameLimit()
 	return their, nil
 }
 
@@ -187,6 +183,14 @@ func readProtocolHandshake(rw p2p.MsgReader, our *protoHandshake) (*protoHandsha
 		return nil, p2p.DiscInvalidIdentity
 	}
 	return &hs, nil
+}
+
+// raiseFrameLimit promotes the frame size limit from the handshake-phase
+// bound to the steady-state bound. It is called by setupConn after the
+// protocol handshake and identity checks succeed, before the addpeer
+// checkpoint.
+func (t *rlpx) raiseFrameLimit() {
+	t.rw.raiseFrameLimit()
 }
 
 func (t *rlpx) doEncHandshake(prv *ecdsa.PrivateKey, dial *discover.Node) (discover.NodeID, error) {
@@ -560,15 +564,19 @@ func (rw *rlpxFrameRW) raiseFrameLimit() {
 func (rw *rlpxFrameRW) WriteMsg(msg p2p.Msg) error {
 	ptype, _ := rlp.EncodeToBytes(msg.Code)
 
-	// write header
-	headbuf := make([]byte, 32)
-	fsize := uint32(len(ptype)) + msg.Size
-	if fsize > maxUint24 {
+	// Compute the frame size in uint64 so the addition cannot wrap.
+	// Reject before writing bytes or advancing cipher/MAC state.
+	fsize64 := uint64(len(ptype)) + uint64(msg.Size)
+	if fsize64 > uint64(maxUint24) {
 		return errors.New("message size overflows uint24")
 	}
-	if fsize > rw.maxFrameSize {
-		return fmt.Errorf("frame size %d exceeds limit %d", fsize, rw.maxFrameSize)
+	if fsize64 > uint64(rw.maxFrameSize) {
+		return fmt.Errorf("frame size %d exceeds limit %d", fsize64, rw.maxFrameSize)
 	}
+	fsize := uint32(fsize64)
+
+	// write header
+	headbuf := make([]byte, 32)
 	putInt24(fsize, headbuf) // TODO: check overflow
 	copy(headbuf[3:], zeroHeader)
 	rw.enc.XORKeyStream(headbuf[:16], headbuf[:16]) // first half is now encrypted
