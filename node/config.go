@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -121,10 +123,34 @@ type RPCConfig struct {
 	HTTPVirtualHosts []string
 	HTTPCors         []string
 	WSOrigins        []string
+
+	// MaxSubscriptionsPerConn bounds the subscriptions one RPC connection may
+	// hold; a further subscribe on that connection fails with "too many
+	// subscriptions on this connection". MaxSubscriptions bounds live
+	// subscriptions across all connections, IPC and in-process included;
+	// once reached, every new subscribe fails with "subscribe server
+	// subscription limit reached" until a slot is released. Zero selects
+	// the built-in default for either.
+	MaxSubscriptionsPerConn int
+	MaxSubscriptions        int
+	// MaxWSConnectionsPerIP bounds concurrent WebSocket connections from a
+	// single remote IP address; connections in excess are refused with HTTP
+	// 429. Zero means no per-IP limit. This composes with the per-connection
+	// subscription limit: with MaxSubscriptionsPerConn subscriptions per
+	// connection and MaxWSConnectionsPerIP connections, one address can hold
+	// at most their product in subscriptions.
+	MaxWSConnectionsPerIP int
 }
 type NetConfig struct {
 	ListenHost string
 	ListenPort int
+
+	// P2PBackend selects which transport backend to start: "auto"
+	// (default, spork-gated), "libp2p" (skip oracle, start libp2p
+	// directly), or "legacy" (start legacy, never swap). The
+	// "libp2p" value lets a fresh node bootstrap from a post-activation
+	// network where no legacy peers remain (issue #105).
+	P2PBackend string
 
 	MinPeers          int
 	MinConnectedPeers int
@@ -219,6 +245,7 @@ func (c *Config) makeZenonConfig(walletManager *wallet.Manager) (*zenon.Config, 
 		ProducingKeyPair:  pillarCoinbase,
 		GenesisConfig:     c.makeGenesisConfig(),
 		DataDir:           c.DataPath,
+		MaxSubscriptions:  c.RPC.MaxSubscriptions,
 	}, nil
 }
 func (c *Config) makeGenesisConfig() (genesisConfig store.Genesis) {
@@ -321,19 +348,74 @@ func (c *Config) makeNetConfig() *p2p.Net {
 		NATPortMap:        c.Net.NATPortMap,
 		PeerstoreDir:      peerstoreDir,
 		NodeDatabase:      networkDataDir,
+		P2PBackend:        p2p.P2PBackend(c.Net.P2PBackend),
 		ListenAddr:        c.Net.ListenHost,
 		ListenPort:        c.Net.ListenPort,
 	}
 }
+
+// joinHostPort builds a host:port listen address, handling IPv6 literals
+// in both raw and pre-bracketed form.
+//
+// Malformed bracketed input (e.g. "[]", "[[]]", "[[::]]", "[0.0.0.0",
+// "0.0.0.0]") is rejected with an error.
+// net.SplitHostPort("[]:35997") returns host "" with a nil error, so an
+// explicit error is the only thing callers can act on.
+func joinHostPort(host string, port int) (string, error) {
+	normalized, ok := normalizeListenHost(host)
+	if !ok {
+		return "", fmt.Errorf("malformed listen host %q", host)
+	}
+	return net.JoinHostPort(normalized, strconv.Itoa(port)), nil
+}
+
+// normalizeListenHost strips at most one enclosing bracket pair from a
+// pre-bracketed IPv6 literal. It reports ok=false for empty bracketed ("[]"),
+// unbalanced or nested input, so that such configuration is rejected rather
+// than silently repaired into a valid address.
+func normalizeListenHost(host string) (string, bool) {
+	if host == "" {
+		return "", true
+	}
+	if strings.HasPrefix(host, "[") {
+		if !strings.HasSuffix(host, "]") {
+			return "", false
+		}
+		inner := host[1 : len(host)-1]
+		// "[]" and "[[]]" strip to an empty or bracket-bearing interior.
+		// Returning "" would join to ":port", which net.Listen resolves as
+		// a wildcard bind on every interface, so both must fail closed.
+		if inner == "" || strings.ContainsAny(inner, "[]") {
+			return "", false
+		}
+		return inner, true
+	}
+	if strings.ContainsAny(host, "[]") {
+		return "", false
+	}
+	return host, true
+}
+
 func (c *Config) HTTPEndpoint() string {
 	if c.RPC.HTTPHost == "" {
 		return ""
 	}
-	return fmt.Sprintf("%s:%d", c.RPC.HTTPHost, c.RPC.HTTPPort)
+	endpoint, err := joinHostPort(c.RPC.HTTPHost, c.RPC.HTTPPort)
+	if err != nil {
+		// Display helper with no error path. A malformed host yields no
+		// endpoint rather than a wrong one; callers that must not accept a
+		// bad configuration use setListenAddr, which propagates.
+		return ""
+	}
+	return endpoint
 }
 func (c *Config) WSEndpoint() string {
 	if c.RPC.WSHost == "" {
 		return ""
 	}
-	return fmt.Sprintf("%s:%d", c.RPC.WSHost, c.RPC.WSPort)
+	endpoint, err := joinHostPort(c.RPC.WSHost, c.RPC.WSPort)
+	if err != nil {
+		return ""
+	}
+	return endpoint
 }

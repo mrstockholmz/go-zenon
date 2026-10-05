@@ -98,13 +98,18 @@ func NewNode(conf *Config) (*Node, error) {
 		return nil, fmt.Errorf("parse libp2p bootstrap peers: %w", err)
 	}
 
+	listenAddr, err := joinHostPort(netConfig.ListenAddr, netConfig.ListenPort)
+	if err != nil {
+		return nil, fmt.Errorf("invalid p2p listen address: %w", err)
+	}
+
 	node.server = &switcher.Server{
 		PrivateKey:        netConfig.PrivateKey(),
 		Name:              netConfig.Name,
 		MaxPeers:          netConfig.MaxPeers,
 		MinConnectedPeers: netConfig.MinConnectedPeers,
 		MaxPendingPeers:   netConfig.MaxPendingPeers,
-		ListenAddr:        fmt.Sprintf("%v:%v", netConfig.ListenAddr, netConfig.ListenPort),
+		ListenAddr:        listenAddr,
 		Protocols:         node.z.Protocol().SubProtocols,
 
 		// Per-backend bootstrap material — the switcher uses whichever
@@ -114,6 +119,11 @@ func NewNode(conf *Config) (*Node, error) {
 		Libp2pBootstrapPeers: libp2pBootstrap,
 		NATPortMap:           netConfig.NATPortMap,
 		PeerstoreDir:         netConfig.PeerstoreDir,
+
+		// Backend override (issue #105). "libp2p" lets a fresh node
+		// bootstrap from a post-activation network where no legacy
+		// peers remain. Empty string defaults to auto (spork-gated).
+		P2PBackend: netConfig.P2PBackend,
 
 		// Activation gate. The switcher polls this on a 1s ticker; when
 		// it returns true (the libp2p spork's EnforcementHeight has
