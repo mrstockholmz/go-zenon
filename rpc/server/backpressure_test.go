@@ -544,6 +544,76 @@ func TestEmptyBatchBackpressure(t *testing.T) {
 	wg.Wait()
 }
 
+// TestEmptyBatchBlocksSecondRead verifies that the synchronous empty-batch
+// reply applies backpressure: after the server reads the first "[]" and
+// blocks writing its reply (nobody reads from the pipe), a second "[]"
+// write must still be blocked. If the empty-batch path fell through to the
+// async handler, the first write would complete and the read goroutine would
+// return to readBatch, letting the second write complete too.
+func TestEmptyBatchBlocksSecondRead(t *testing.T) {
+	server, svc := newBackpressureTestServer(t)
+
+	// Raw pipe: the server serves on p1, the test writes on p2. No client
+	// is created, so nobody reads from p2 — the server's reply write blocks.
+	p1, p2 := net.Pipe()
+	go server.ServeCodec(NewCodec(p1), 0)
+	defer p2.Close()
+
+	// Saturate all call slots by writing test.block requests directly.
+	// Each write completes when the server reads it; the handler goroutine
+	// blocks in test.block, holding the slot.
+	const saturating = maxConcurrentCallsPerConn
+	blockReq := []byte(`{"jsonrpc":"2.0","id":1,"method":"test.block"}`)
+	for i := 0; i < saturating; i++ {
+		writeDone := make(chan struct{})
+		go func() {
+			defer close(writeDone)
+			p2.Write(blockReq)
+		}()
+		select {
+		case <-writeDone:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("block request %d was not read within timeout", i)
+		}
+	}
+	waitForRunning(t, svc, saturating)
+
+	// Write the first empty batch. The server reads it and enters the
+	// synchronous reply path, blocking on writeJSON because the pipe has no
+	// reader. The write completes (the server consumed the bytes).
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		p2.Write([]byte("[]"))
+	}()
+	select {
+	case <-firstDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first empty batch was not read within timeout")
+	}
+
+	// Give the server a moment to enter the synchronous writeJSON call.
+	time.Sleep(100 * time.Millisecond)
+
+	// Write a second empty batch. The read goroutine is still blocked in
+	// writeJSON from the first reply, so it cannot have returned to
+	// readBatch. The second write must therefore be blocked.
+	secondDone := make(chan struct{})
+	go func() {
+		defer close(secondDone)
+		p2.Write([]byte("[]"))
+	}()
+	select {
+	case <-secondDone:
+		t.Fatal("second empty batch write completed — read goroutine returned to readBatch, synchronous reply path is not applying backpressure")
+	case <-time.After(500 * time.Millisecond):
+		// Expected: still blocked.
+	}
+
+	// Unblock the handlers so cleanup can proceed.
+	close(svc.blockChan)
+}
+
 // TestDrainReadReturnsPermit verifies that drainRead returns a call-slot
 // permit when dropping an op that had acquired one.
 func TestDrainReadReturnsPermit(t *testing.T) {
