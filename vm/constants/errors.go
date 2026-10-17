@@ -110,4 +110,7 @@ var (
 	// Liquidity
 	ErrInvalidPercentages = errors.New("invalid percentages")
 	ErrInvalidRewards     = errors.New("invalid liquidity stake rewards")
+
+	// Dynamic Plasma spork
+	ErrABDataTrailingBytes = errors.New("account-block data has trailing bytes past ABI-encoded arguments")
 )
