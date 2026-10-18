@@ -200,7 +200,11 @@ func (cs *contentSelector) filterBlocksToCommit(blocks []*nom.AccountBlock) []*n
 	// always conservative.
 	sizeEstimate := worstCaseMomentumHeaderSize() + listPrefixAllowance
 	toCommit := make([]*nom.AccountBlock, 0, len(blocks))
-	contractBatch := make([]*nom.AccountBlock, 0, int(cs.plasma.MaxContractBlocksInMomentum()))
+	// Cap the preallocation at the input size: the selector cannot pick more
+	// contract blocks than there are pending blocks, and the configured upper
+	// bound can imply a ~32 GB allocation (issue #164).
+	contractCap := min(uint64(len(blocks)), cs.plasma.MaxContractBlocksInMomentum())
+	contractBatch := make([]*nom.AccountBlock, 0, contractCap)
 	skippedAddresses := make(map[types.Address]bool)
 	for _, block := range blocks {
 		if types.IsEmbeddedAddress(block.Address) {
