@@ -543,6 +543,7 @@ func TestInsertChain_OversizedContentIsRefusedBeforePoolWork(t *testing.T) {
 	_, err := b.bridge.InsertChain([]*nom.DetailedMomentum{extendingListing(t, z, chain.MaxAccountBlocksInMomentum+1)})
 	expectRefusedOnCount(t, err)
 	common.Expect(t, b.verifier.momentums, 0)
+	common.Expect(t, b.pool.snapshots, 0)
 	expectUntouched(t, z, original, b)
 }
 

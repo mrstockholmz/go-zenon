@@ -338,6 +338,20 @@ func (c chainBridge) restoreBranch(insert sync.Locker, target types.HashHeight, 
 // that reason about the committed prefix must use committed, not failed.
 func (c chainBridge) insertMomentums(insert sync.Locker, momentums []*nom.DetailedMomentum) (failed, committed int, err error) {
 	for index, supplied := range momentums {
+		// Reject a momentum whose content exceeds the limit before any
+		// lock-held work: no copy, no snapshot, no pool insertion. The
+		// verifier applies the same rule later; checking here first keeps
+		// an oversized momentum's blocks out of the pool and the VM (issue
+		// #167).
+		maxContent, err := verifier.MaxMomentumContent(c.chain.GetFrontierMomentumStore())
+		if err != nil {
+			return index, index, err
+		}
+		if uint64(len(supplied.AccountBlocks)) > maxContent {
+			log.Info("refusing momentum with too many account-blocks", "num-blocks", len(supplied.AccountBlocks), "max", maxContent, "momentum-identifier", supplied.Momentum.Identifier())
+			return index, index, verifier.ErrMContentTooBig
+		}
+
 		// The caller keeps using its own objects concurrently (the fetcher
 		// broadcasts the same DetailedMomentum while importing it), and the
 		// VM writes computed plasma fields onto whatever block it applies,
@@ -381,9 +395,9 @@ func (c chainBridge) insertMomentums(insert sync.Locker, momentums []*nom.Detail
 // How many blocks a momentum may carry is not checked here: before dynamic
 // plasma it is a fixed count, after it a plasma budget, and which rule
 // applies is known only against the chain the momentum extends. That check
-// (verifier.MaxMomentumContent) runs in insertMomentum, when the frontier is
-// the momentum's previous, before any block reaches the pool, and again in
-// the momentum verifier. The work here is linear in the list, which the
+// (verifier.MaxMomentumContent) runs at the top of insertMomentums, before
+// any copy or snapshot, when the frontier is the momentum's previous, before
+// any block reaches the pool, and again in the momentum verifier. The work here is linear in the list, which the
 // protocol message size bounds. The supplied momentum is not modified.
 func validatePrefetchedBlocks(detailed *nom.DetailedMomentum) error {
 	if detailed == nil || detailed.Momentum == nil {
@@ -440,19 +454,8 @@ func momentumAddresses(detailed *nom.DetailedMomentum) []types.Address {
 // frontierBefore is the canonical frontier the caller observed before the
 // call; it tells a commit failure apart from a failure after the commit.
 func (c chainBridge) insertMomentum(insert sync.Locker, detailed *nom.DetailedMomentum, frontierBefore types.HashHeight) error {
-	// How many blocks a momentum may list depends on the chain it extends,
-	// which is the frontier here. The verifier applies the same rule to the
-	// momentum later; applying it first keeps an oversized momentum's blocks
-	// out of the pool and the VM.
-	maxContent, err := verifier.MaxMomentumContent(c.chain.GetFrontierMomentumStore())
-	if err != nil {
-		return err
-	}
-	if uint64(len(detailed.AccountBlocks)) > maxContent {
-		log.Info("refusing momentum with too many account-blocks", "num-blocks", len(detailed.AccountBlocks), "max", maxContent, "momentum-identifier", detailed.Momentum.Identifier())
-		return verifier.ErrMContentTooBig
-	}
-
+	// The content limit was already checked in insertMomentums before any
+	// lock-held work; the blocks here are private copies that passed it.
 	for _, block := range detailed.AccountBlocks {
 		if block.BlockType == nom.BlockTypeContractSend {
 			continue
