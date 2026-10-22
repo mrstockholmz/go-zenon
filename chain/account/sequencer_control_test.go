@@ -1,9 +1,12 @@
 package account
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/syndtr/goleveldb/leveldb"
 
 	"github.com/zenon-network/go-zenon/chain/account/mailbox"
 	"github.com/zenon-network/go-zenon/common"
@@ -30,6 +33,9 @@ func TestSequencerFrontIndexReadError(t *testing.T) {
 	if !strings.Contains(err.Error(), "failed to read sequencer front index") {
 		t.Fatalf("expected read diagnostic, got: %v", err)
 	}
+	if !errors.Is(err, leveldb.ErrClosed) {
+		t.Fatalf("expected errors.Is(err, leveldb.ErrClosed), got: %v", err)
+	}
 }
 
 func TestSequencerFrontPropagatesReadError(t *testing.T) {
@@ -41,6 +47,9 @@ func TestSequencerFrontPropagatesReadError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "failed to read sequencer front index") {
 		t.Fatalf("expected counter read diagnostic, got: %v", err)
+	}
+	if !errors.Is(err, leveldb.ErrClosed) {
+		t.Fatalf("expected errors.Is(err, leveldb.ErrClosed), got: %v", err)
 	}
 }
 
@@ -76,6 +85,46 @@ func TestSequencerFrontPropagatesMailboxCorruption(t *testing.T) {
 	if !strings.Contains(err.Error(), "too short") {
 		t.Fatalf("expected 'too short' diagnostic, got: %v", err)
 	}
+}
+
+// recordingDB wraps a db.DB and counts Put calls so tests can assert
+// that a panicking mutator performed no writes.
+type recordingDB struct {
+	db.DB
+	puts int
+}
+
+func (r *recordingDB) Put(key, value []byte) error {
+	r.puts++
+	return r.DB.Put(key, value)
+}
+
+// TestSequencerPopFrontCorruptCounterNoWrite verifies that
+// SequencerPopFront panics on a corrupt front-index before issuing any
+// Put: the read fails, DealWithErr panics, and the recording DB must
+// show zero writes.
+func TestSequencerPopFrontCorruptCounterNoWrite(t *testing.T) {
+	memdb := db.NewMemDB()
+	rec := &recordingDB{DB: memdb}
+
+	// Corrupt the front index: too short for uint64 decoding.
+	// sequencerLastReceivedKey is defined in chain/account/keys.go.
+	if err := memdb.Put(sequencerLastReceivedKey, []byte{1, 2, 3}); err != nil {
+		t.Fatal(err)
+	}
+
+	as := NewAccountStore(controlAddress, rec)
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic on corrupt front index, got none")
+		}
+		if rec.puts != 0 {
+			t.Fatalf("expected 0 Put calls on panic, got %d", rec.puts)
+		}
+	}()
+	as.SequencerPopFront()
 }
 
 func TestIdentifierCorruptFrontierEntry(t *testing.T) {
