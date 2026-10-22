@@ -1,8 +1,11 @@
 package mailbox
 
 import (
+	"errors"
 	"strings"
 	"testing"
+
+	"github.com/syndtr/goleveldb/leveldb"
 
 	"github.com/zenon-network/go-zenon/common"
 	"github.com/zenon-network/go-zenon/common/db"
@@ -80,4 +83,53 @@ func TestSequencerSizeReadError(t *testing.T) {
 	if !strings.Contains(err.Error(), "failed to read sequencer size") {
 		t.Fatalf("expected read diagnostic, got: %v", err)
 	}
+	if !errors.Is(err, leveldb.ErrClosed) {
+		t.Fatalf("expected errors.Is(err, leveldb.ErrClosed), got: %v", err)
+	}
+}
+
+// recordingDB wraps a db.DB and counts Put calls so tests can assert
+// that a panicking mutator performed no writes.
+type recordingDB struct {
+	db.DB
+	puts int
+}
+
+func (r *recordingDB) Put(key, value []byte) error {
+	r.puts++
+	return r.DB.Put(key, value)
+}
+
+// TestSequencerPushBackCorruptCounterNoWrite verifies that
+// SequencerPushBack panics on a corrupt counter before issuing any
+// Put: the counter read fails, DealWithErr panics, and the recording DB
+// must show zero writes.
+func TestSequencerPushBackCorruptCounterNoWrite(t *testing.T) {
+	mem := db.NewMemDB()
+	rec := &recordingDB{DB: mem}
+	m := NewAccountMailbox(types.PillarContract, rec)
+
+	// Corrupt the counter: too short for uint64 decoding.
+	if err := mem.Put(sequencerNumInsertedKey, []byte{1, 2, 3}); err != nil {
+		t.Fatal(err)
+	}
+
+	header := types.AccountHeader{
+		Address: types.Address{1},
+		HashHeight: types.HashHeight{
+			Hash:   types.Hash{2},
+			Height: 1,
+		},
+	}
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic on corrupt counter, got none")
+		}
+		if rec.puts != 0 {
+			t.Fatalf("expected 0 Put calls on panic, got %d", rec.puts)
+		}
+	}()
+	m.SequencerPushBack(header)
 }
