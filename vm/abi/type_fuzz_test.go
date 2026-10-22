@@ -32,12 +32,25 @@ func TestNewType_Valid(t *testing.T) {
 // it exercises the overflow guard (not the Atoi guard) on both 32-bit and
 // 64-bit architectures.
 func TestNewType_ArrayOverflow(t *testing.T) {
-	// On 64-bit: uint64[2^61] fits in int but 2^61 * 8 overflows MaxInt64.
-	// On 32-bit: uint64[2^29] fits in int but 2^29 * 8 overflows MaxInt32.
+	// On 64-bit: uint64[2^60] is rejected because 2^60 > MaxInt64/8.
+	// On 32-bit: uint64[2^28] is rejected because 2^28 > MaxInt32/8.
 	size := math.MaxInt/8 + 1
 	_, err := NewType(fmt.Sprintf("uint64[%d]", size))
 	if err == nil {
 		t.Fatal("expected error for overflowing array size, got nil")
+	}
+}
+
+// TestNewType_ArrayUintptrOverflow pins the boundary that would overflow
+// MaxUintptr (not just MaxInt) when multiplied by the element size.
+// reflect.ArrayOf checks against MaxUintptr, so without the overflow guard
+// this case would reproduce the original panic from issue #197.
+// On 64-bit: uint64[2^61], on 32-bit: uint64[2^29].
+func TestNewType_ArrayUintptrOverflow(t *testing.T) {
+	size := math.MaxInt/8*2 + 2
+	_, err := NewType(fmt.Sprintf("uint64[%d]", size))
+	if err == nil {
+		t.Fatal("expected error for uintptr-overflowing array size, got nil")
 	}
 }
 
@@ -63,7 +76,7 @@ func TestNewType_ArrayNormal(t *testing.T) {
 }
 
 // TestNewType_ArrayBoundary verifies the exact overflow boundary on 64-bit:
-// uint64[2^60-1] is accepted (size * 8 == MaxInt64), uint64[2^60] is rejected.
+// uint64[2^60-1] is accepted (size * 8 == MaxInt64-7), uint64[2^60] is rejected.
 func TestNewType_ArrayBoundary(t *testing.T) {
 	if strconv.IntSize != 64 {
 		t.Skip("boundary values are 64-bit specific")
