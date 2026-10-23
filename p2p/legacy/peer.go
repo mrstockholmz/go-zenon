@@ -212,9 +212,11 @@ loop:
 
 	p.rw.close(reason)
 	close(p.closed)
-	common.P2PLogger.Debug("wg.Wait() peer.run()")
-	// p.wg.Wait()
-	common.P2PLogger.Debug("wg.Wait() peer.run() finished")
+	// Wait for readLoop, pingLoop and all protocol goroutines to finish
+	// before returning. protoErr is buffered (len(protomap)+1) so those
+	// sends cannot block, and every goroutine selects on p.closed or
+	// finishes after the transport close above.
+	p.wg.Wait()
 	if requested {
 		reason = p2p.DiscRequested
 	}

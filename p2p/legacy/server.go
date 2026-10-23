@@ -300,9 +300,8 @@ func (srv *Server) Self() *discover.Node {
 // It blocks until all active connections have been closed.
 func (srv *Server) Stop() {
 	srv.lock.Lock()
-	defer srv.lock.Unlock()
-
 	if !srv.running.Load() {
+		srv.lock.Unlock()
 		return
 	}
 
@@ -312,6 +311,13 @@ func (srv *Server) Stop() {
 		srv.listener.Close()
 	}
 	close(srv.quit)
+	srv.lock.Unlock()
+
+	// Wait for the run loop, listenLoop, setupConn goroutines and all
+	// peer goroutines to finish. This must happen after releasing
+	// srv.lock: handshake checks call Self which takes the same lock,
+	// so waiting here while holding the lock would deadlock.
+	srv.loopWG.Wait()
 }
 
 // Start starts running the server.
@@ -526,7 +532,10 @@ running:
 			}
 			common.P2PLogger.Debug("<-posthandshake:", c)
 			// TODO: track in-progress inbound node IDs (pre-Peer) to avoid dialing them.
-			c.cont <- srv.encHandshakeChecks(peers, c)
+			select {
+			case c.cont <- srv.encHandshakeChecks(peers, c):
+			case <-srv.quit:
+			}
 		case c := <-srv.addpeer:
 			// At this point the connection is past the protocol handshake.
 			// Its capabilities are known and the remote identity is verified.
@@ -548,7 +557,10 @@ running:
 			// The dialer logic relies on the assumption that
 			// dial tasks complete after the peer has been added or
 			// discarded. Unblock the task last.
-			c.cont <- err
+			select {
+			case c.cont <- err:
+			case <-srv.quit:
+			}
 		case p := <-srv.delpeer:
 			// A peer disconnected.
 			common.P2PLogger.Debug("<-delpeer:", "peer", p)
