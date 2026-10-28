@@ -93,6 +93,9 @@ func (av *accountVerifier) getContext(block *nom.AccountBlock) (store.Account, s
 		if err != nil {
 			return nil, nil, InternalError(err)
 		}
+		if globalFrontier == nil {
+			return nil, nil, ErrABPreviousMissing
+		}
 
 		if globalFrontier.Height > block.Height-1 {
 			block, err := globalStore.ByHash(block.PreviousHash)
