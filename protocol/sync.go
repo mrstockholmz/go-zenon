@@ -167,6 +167,15 @@ func (pm *ProtocolManager) syncInfo() *SyncInfo {
 		state = Syncing
 	}
 
+	// A peer whose advertised height has not been validated by a
+	// completed sync must not hold the pillar silent.  Only a
+	// downloader that is actively retrieving or importing blocks, or
+	// whose last completed sync left verified work still being imported,
+	// justifies the Syncing state.
+	if state == Syncing && !pm.syncActive() {
+		state = SyncDone
+	}
+
 	// if there are not enough peers, return this instead
 	if pm.peers.Len() < pm.minPeers {
 		state = NotEnoughPeers
@@ -177,6 +186,21 @@ func (pm *ProtocolManager) syncInfo() *SyncInfo {
 		CurrentHeight: currentHeight,
 		TargetHeight:  targetHeight,
 	}
+}
+
+// syncActive reports whether the downloader or fetcher currently has
+// outstanding sync work.  An idle downloader and fetcher means no sync
+// is in progress, so an unverified advertised height must not keep the
+// pillar muted.
+func (pm *ProtocolManager) syncActive() bool {
+	if pm.downloader.Synchronising() {
+		return true
+	}
+	_, cached, importing, _ := pm.downloader.Stats()
+	if cached > 0 || importing > 0 {
+		return true
+	}
+	return pm.fetcher.Active()
 }
 
 // synchronise tries to sync up our local block chain with a remote peer.

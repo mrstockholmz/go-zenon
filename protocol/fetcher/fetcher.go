@@ -132,6 +132,13 @@ type Fetcher struct {
 	wg sync.WaitGroup
 }
 
+// Active returns true when the fetcher has outstanding work: announced
+// hashes awaiting retrieval, in-flight fetches, or queued blocks not yet
+// imported.
+func (f *Fetcher) Active() bool {
+	return len(f.announced) > 0 || len(f.fetching) > 0 || len(f.queued) > 0
+}
+
 // New creates a block fetcher to retrieve blocks based on hash announcements.
 func New(getBlock blockRetrievalFn, verifyBlock blockVerifierFn, broadcastBlock blockBroadcasterFn, chainHeight chainHeightFn, insertChain chainInsertFn, dropPeer peerDropFn) *Fetcher {
 	return &Fetcher{

@@ -389,3 +389,15 @@ func (ps *peerSet) BestPeer() *peer {
 	}
 	return bestPeer
 }
+
+// AllPeers returns a snapshot of every registered peer.
+func (ps *peerSet) AllPeers() []*peer {
+	ps.lock.RLock()
+	defer ps.lock.RUnlock()
+
+	list := make([]*peer, 0, len(ps.peers))
+	for _, p := range ps.peers {
+		list = append(list, p)
+	}
+	return list
+}
