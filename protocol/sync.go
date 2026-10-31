@@ -163,8 +163,14 @@ func (pm *ProtocolManager) syncInfo() *SyncInfo {
 	var state SyncState
 	if currentHeight >= targetHeight {
 		state = SyncDone
-	} else {
+	} else if pm.downloader.Synchronising() {
+		// Only an active download mutes production.  An unverified
+		// advertised height must not silence the pillar: a peer whose
+		// claim is stale, wrong or never backed by a completed sync
+		// would otherwise mute it indefinitely (issue #240).
 		state = Syncing
+	} else {
+		state = SyncDone
 	}
 
 	// if there are not enough peers, return this instead
