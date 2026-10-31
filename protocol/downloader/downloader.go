@@ -52,6 +52,7 @@ var (
 	blockSoftTTL    = 3 * time.Second  // Request completion threshold for increasing or decreasing a peer's bandwidth
 	blockHardTTL    = 3 * blockSoftTTL // Maximum time allowance before a block request is considered expired
 	crossCheckCycle = time.Second      // Period after which to check for expired cross checks
+	stallTimeout    = 4 * blockHardTTL // Maximum time the block phase may run without TakeBlocks handing over a block
 
 	maxQueuedHashes = 256 * 1024 // Maximum number of hashes to queue for import (DOS protection)
 	maxBannedHashes = 4096       // Number of bannable hashes before phasing old ones out
@@ -75,6 +76,7 @@ var (
 	errCancelHashFetch  = errors.New("hash fetching canceled (requested)")
 	errCancelBlockFetch = errors.New("block downloading canceled (requested)")
 	errNoSyncActive     = errors.New("no sync active")
+	errStallNoProgress  = errors.New("block download stalled: no progress")
 )
 
 // hashCheckFn is a callback type for verifying a hash's presence in the local chain.
@@ -259,7 +261,7 @@ func (d *Downloader) Synchronise(id string, head types.Hash, td uint64) {
 	case errBusy:
 		log.Debug("Synchronisation already in progress")
 
-	case errTimeout, errBadPeer, errStallingPeer, errBannedHead, errEmptyHashSet, errPeersUnavailable, errInvalidChain, errCrossCheckFailed:
+	case errTimeout, errBadPeer, errStallingPeer, errBannedHead, errEmptyHashSet, errPeersUnavailable, errInvalidChain, errCrossCheckFailed, errStallNoProgress:
 		log.Info("Removing peer", "peer-id", id, "reason", err)
 		d.dropPeer(id)
 
@@ -665,6 +667,15 @@ func (d *Downloader) fetchBlocks(from uint64) error {
 	d.queue.Prepare(from)
 	finished := false
 
+	// Track forward progress: blockOffset advances only when TakeBlocks
+	// hands over a contiguous run of blocks. A peer that withholds the
+	// head block of the download window can otherwise keep the session
+	// open indefinitely — the cache fills behind the hole, Reserve
+	// returns nil, and the peers-unavailable guard is skipped because
+	// the cache has no free space (issue #247).
+	lastProgress := time.Now()
+	lastOffset := d.queue.BlockOffset()
+
 	for {
 		select {
 		case <-d.cancelCh:
@@ -790,6 +801,21 @@ func (d *Downloader) fetchBlocks(from uint64) error {
 					d.queue.Cancel(request)
 				}
 			}
+			// Session-level no-progress deadline. If the block phase has
+			// been running without TakeBlocks handing over a block for
+			// longer than stallTimeout while hashes are still pending,
+			// the session is stuck (e.g. a peer withholding the head
+			// block of the download window). Cancel so Synchronise can
+			// drop the peer and retry with another.
+			if offset := d.queue.BlockOffset(); offset != lastOffset {
+				lastOffset = offset
+				lastProgress = time.Now()
+			}
+			if d.queue.Pending() > 0 && time.Since(lastProgress) > stallTimeout {
+				log.Warn("Block download stalled: no progress", "pending", d.queue.Pending(), "last-progress", lastProgress)
+				return errStallNoProgress
+			}
+
 			// Make sure that we have peers available for fetching. If all peers have been tried
 			// and all failed throw an error
 			if !d.queue.Throttle() && d.queue.InFlight() == 0 && ((len(d.queue.blockCache)/2)-len(d.queue.blockPool)) > 0 {

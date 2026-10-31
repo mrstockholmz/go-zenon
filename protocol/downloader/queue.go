@@ -98,6 +98,15 @@ func (q *queue) Size() (int, int) {
 	return len(q.hashPool), len(q.blockPool)
 }
 
+// BlockOffset returns the height of the first cached block, which
+// advances whenever TakeBlocks hands over a contiguous run.
+func (q *queue) BlockOffset() uint64 {
+	q.lock.RLock()
+	defer q.lock.RUnlock()
+
+	return q.blockOffset
+}
+
 // Pending retrieves the number of hashes pending for retrieval.
 func (q *queue) Pending() int {
 	q.lock.RLock()
