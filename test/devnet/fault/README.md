@@ -28,25 +28,48 @@ test/devnet/fault/overlay.sh "$PWD" > build/fault-overlay.json
 go build -overlay build/fault-overlay.json -o build/linux-fault/znnd ./cmd/znnd
 ```
 
-or a fault image by passing the overlay to the docker build the same way
-`FAST=1` does it in `test/devnet/build-image.sh` (image name
+or the image built by `FAULT=1 test/devnet/build-image.sh` (image name
 `go-zenon-devnet-fault:latest`).
 
 ## Scope and what is still missing
 
+- **The liar needs the devnet's genesis.** The image bakes the stock
+  `docker/devnet/genesis.json`, and the entrypoint only copies
+  `/devnet/genesis.json` into a data dir that has no `config.json`
+  yet. A fault container started with a plain `docker run` (as the
+  driver case does) therefore inits the stock genesis block; on any
+  non-stock variant every pillar refuses it at the eth/61 handshake
+  with `Genesis block mismatch` and the liar syncs nothing — a
+  silently vacuous run (observed 2026-11-20: the rate assertion
+  passed while the liar sat at height 1). The case copies the genesis
+  out of a running devnet container and bind-mounts it over
+  `/devnet/genesis.json`; keep that in any other fault-container
+  tooling.
 - **Legacy backend only.** The overlay patches `protocol/handler.go`, the
   legacy devp2p handler. On variants where the libp2p spork is in force
   (staged/fast/all-on past its height) the liar is inert; a libp2p fault
   peer is still to be written. `TestFaultPeerDrip` skips there.
-- **No fault role yet.** The devnet image configures roles from
-  `docker/devnet/<role>`; a `fault` role (config with the pillars as
-  bootstrap peers) is part of the remaining work, as is wiring
-  `FAULT=1 test/devnet/build-image.sh`.
+- **Fault role.** The devnet image configures roles from
+  `docker/devnet/<role>`; the fault role ships in this branch
+  (`docker/devnet/fault`, an observer-style config that dials all four
+  pillars; znnd generates a fresh network key on first boot, so the liar
+  never reuses another node's identity).
 - **Never on any real network.** The fault binary must never join mainnet,
   testnet, or any network with value.
 
 The driver case `TestFaultPeerDrip` in `test/e2e/` (gated on `E2E_FAULT=1`)
-measures production rate with and without the liar connected; it is a
-capability harness for N-5, not yet a fix discriminator (the phase-29
-rehearsal showed this liar's sessions end fast on both pre- and post-fix
-binaries).
+measures production rate with and without the liar connected and asserts
+production continues (the post-#306 expectation); it skips when the
+libp2p spork is live. It is a capability harness for N-5, not yet a fix
+discriminator (the phase-29 rehearsal showed this liar's sessions end
+fast on both pre- and post-fix binaries).
+
+**Run end-to-end 2026-11-20** (evidence `docs/test-results/2026-11-20-fault-peer/`):
+PASS in 481 s on `all-off`, baseline 6.00 momentums/min, with the liar 6.00,
+liar syncer asserted at the network frontier (195/195), 96 pillar-side
+`peer connected ... devnet-fault` lines. Two gotchas cost a run each and
+are now handled in the case: the liar needs the devnet's genesis mounted
+(see above — otherwise the run is silently vacuous), and `go test` caches
+a SKIP (use `-count=1`). The drip itself stays inert at the frontier (no
+node requests anything); the fix-discriminating shape (a downloading
+victim behind the liar) is part of the remaining fault-peer work.

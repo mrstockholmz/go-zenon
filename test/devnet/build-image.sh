@@ -10,7 +10,9 @@
 #
 #   GOIMG=golang:1.24.1-alpine test/devnet/build-image.sh
 #   FAST=1 test/devnet/build-image.sh     # the test build, image go-zenon-devnet-fast:latest
+#   FAULT=1 test/devnet/build-image.sh    # the fault-peer build, image go-zenon-devnet-fault:latest
 #
+
 # FAST=1 adds the files in test/devnet/fast/ through a Go build overlay: a short
 # epoch, short locks and a bridge administrator whose key the driver holds. The
 # version string of that binary ends in "+fast-constants". It is for procedure P11
@@ -21,8 +23,11 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 GOIMG="${GOIMG:-golang:1.24.1-alpine}"
 FAST="${FAST:-0}"
+FAULT="${FAULT:-0}"
 if [ "$FAST" = 1 ]; then
   IMAGE="${IMAGE:-go-zenon-devnet-fast:latest}"; OUT="$ROOT/build/linux-fast"
+elif [ "$FAULT" = 1 ]; then
+  IMAGE="${IMAGE:-go-zenon-devnet-fault:latest}"; OUT="$ROOT/build/linux-fault"
 else
   IMAGE="${IMAGE:-go-zenon-devnet:latest}"; OUT="$ROOT/build/linux"
 fi
@@ -36,6 +41,9 @@ OVERLAY=""
 if [ "$FAST" = 1 ]; then
   VERSION="$VERSION+fast-constants"
   "$ROOT/test/devnet/fast/overlay.sh" "$ROOT" /src > "$OUT/overlay.json"
+  OVERLAY="-overlay /out/overlay.json"
+elif [ "$FAULT" = 1 ]; then
+  "$ROOT/test/devnet/fault/overlay.sh" "$ROOT" /src > "$OUT/overlay.json"
   OVERLAY="-overlay /out/overlay.json"
 fi
 

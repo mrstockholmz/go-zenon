@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -35,10 +36,12 @@ import (
 //     it is a capability harness, not a fix discriminator, until a liar
 //     whose sessions stay open exists here.
 //
-// Run it on a stock-variant devnet with the fault image built:
+// Run it on a variant without the libp2p spork in force (all-off; on
+// stock/staged/fast/all-on the libp2p backend takes over and this case
+// skips) with the fault image built:
 //
-//	FAULT=1 test/devnet/build-image.sh   # documented in test/devnet/fault/README.md
-//	test/devnet/up.sh stock
+//	FAULT=1 test/devnet/build-image.sh   # the fault image (test/devnet/fault/README.md)
+//	test/devnet/up.sh all-off
 //	E2E_FAULT=1 go test -tags e2e ./test/e2e/ -run TestFaultPeerDrip -v
 //
 // E2E_FAULT_IMAGE names the image (default go-zenon-devnet-fault:latest)
@@ -83,8 +86,26 @@ func TestFaultPeerDrip(t *testing.T) {
 	base := rate(3 * time.Minute)
 	t.Logf("baseline production: %.2f momentums/min", base)
 
+	// The liar needs the devnet's genesis. The image bakes the stock
+	// genesis and a plain `docker run` gets no variant mount, so on a
+	// non-stock variant (e.g. all-off) the liar inits its own genesis
+	// block and every pillar refuses it at the eth/61 handshake with
+	// "Genesis block mismatch" — observed 2026-11-20, and silently
+	// vacuous: the rate assertion then measures the honest network
+	// twice. Copy the genesis out of a running devnet container and
+	// mount it over the image's stock file.
+	tmp, err := os.MkdirTemp("", "n5-genesis")
+	if err != nil {
+		t.Fatalf("temp dir for the devnet genesis: %v", err)
+	}
+	defer os.RemoveAll(tmp)
+	cp := exec.Command("docker", "cp", prefix+"-pillar:/root/.znn/genesis.json", tmp+"/genesis.json")
+	if out, err := cp.CombinedOutput(); err != nil {
+		t.Fatalf("copy the devnet genesis out of %s-pillar: %v: %s", prefix, err, strings.TrimSpace(string(out)))
+	}
 	run := exec.Command("docker", "run", "-d", "--rm", "--name", liar,
 		"--network", dockerNet,
+		"-v", tmp+"/genesis.json:/devnet/genesis.json:ro",
 		"-e", "ZNND_ROLE=fault",
 		"-e", "ZNN_LIAR=2",
 		image)
@@ -96,6 +117,32 @@ func TestFaultPeerDrip(t *testing.T) {
 	withLiar := rate(5 * time.Minute)
 	t.Logf("production with the fault peer: %.2f momentums/min (baseline %.2f)", withLiar, base)
 
+	// The measurement is only meaningful if the liar actually joined the
+	// devnet: its own syncer must be at the network frontier, not stuck
+	// at genesis behind a refused handshake.
+	liarSync := syncInfo(t, liar)
+	frontier, err := net.Frontier()
+	if err != nil {
+		t.Fatalf("frontier: %v", err)
+	}
+	t.Logf("fault peer sync state: height %d of target %d (network frontier %d)", liarSync.CurrentHeight, liarSync.TargetHeight, frontier.Height)
+	if liarSync.CurrentHeight+5 < frontier.Height {
+		t.Errorf("fault peer never caught up: height %d, network frontier %d — the rate assertion above was vacuous", liarSync.CurrentHeight, frontier.Height)
+	}
+	if logs, err := exec.Command("docker", "exec", liar, "tail", "-n", "3000", "/root/.znn/log/zenon.log").Output(); err == nil {
+		lines := strings.Split(strings.TrimSpace(string(logs)), "\n")
+		var kept []string
+		for _, l := range lines {
+			if strings.Contains(l, "peer connected") || strings.Contains(l, "peer disconnected") || strings.Contains(l, "handshake failed") {
+				kept = append(kept, l)
+			}
+		}
+		if len(kept) > 12 {
+			kept = kept[:12]
+		}
+		t.Logf("fault peer connection log (from /root/.znn/log/zenon.log):\n%s", strings.Join(kept, "\n"))
+	}
+
 	// After #306 the only allowed hold is the bounded stall window, so the
 	// rate may sag but must not collapse. Half of baseline is a generous
 	// floor that no honest flake on a five-node devnet should reach; the
@@ -104,4 +151,31 @@ func TestFaultPeerDrip(t *testing.T) {
 		t.Errorf("production collapsed with the fault peer: %.2f momentums/min vs baseline %.2f", withLiar, base)
 	}
 	fmt.Printf("N-5 drip: baseline %.2f momentums/min, with fault peer %.2f momentums/min\n", base, withLiar)
+}
+
+// syncInfo reads stats.syncInfo from a running container's node over its
+// loopback RPC (busybox wget ships in the devnet image).
+func syncInfo(t *testing.T, container string) struct {
+	State         uint64 `json:"state"`
+	CurrentHeight uint64 `json:"currentHeight"`
+	TargetHeight  uint64 `json:"targetHeight"`
+} {
+	t.Helper()
+	var info struct {
+		Result struct {
+			State         uint64 `json:"state"`
+			CurrentHeight uint64 `json:"currentHeight"`
+			TargetHeight  uint64 `json:"targetHeight"`
+		} `json:"result"`
+	}
+	out, err := exec.Command("docker", "exec", container, "wget", "-qO-",
+		"--post-data={\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"stats.syncInfo\",\"params\":[]}",
+		"--header=Content-Type: application/json", "http://127.0.0.1:35997").Output()
+	if err != nil {
+		t.Fatalf("%s stats.syncInfo: %v (%s)", container, err, strings.TrimSpace(string(out)))
+	}
+	if err := json.Unmarshal(out, &info); err != nil {
+		t.Fatalf("%s stats.syncInfo: %v: %s", container, err, strings.TrimSpace(string(out)))
+	}
+	return info.Result
 }

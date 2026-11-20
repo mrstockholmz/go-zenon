@@ -1,0 +1,12 @@
+e2e: endpoints [http://localhost:35991], chain 69, start height 147, account indexes from 10408
+e2e: sporks enforced: []
+e2e: node v0.0.10-alphanet-739-gc5bba33, fast constants: false
+=== RUN   TestFaultPeerDrip
+    faultpeer_test.go:87: baseline production: 6.00 momentums/min
+    faultpeer_test.go:118: production with the fault peer: 6.00 momentums/min (baseline 6.00)
+    faultpeer_test.go:128: fault peer sync state: height 195 of target 195 (network frontier 195)
+    faultpeer_test.go:143: fault peer connection log (from /root/.znn/log/zenon.log):
+N-5 drip: baseline 6.00 momentums/min, with fault peer 6.00 momentums/min
+--- PASS: TestFaultPeerDrip (480.78s)
+PASS
+ok  	github.com/zenon-network/go-zenon/test/e2e	480.808s
