@@ -60,7 +60,7 @@ config-field	WSOrigins
 config-field	WSPort	
 config-field	WalletPath	
 contract-method	accelerator.AddPhase	E1:FAZ-2 E3:AZ-6 E4:AZ-6 E7:LAD-4b
-contract-method	accelerator.CreateProject	E1:AZ-2 E2:AZ-3 E5:AZ-3 E7:LAD-4b
+contract-method	accelerator.CreateProject	E1:AZ-2 E2:AZ-3 E5:AZ-3 E7:LAD-4b E7:S-1 E7:S-2
 contract-method	accelerator.Donate	E1:AZ-1 E5:AZ-1
 contract-method	accelerator.Update	E1:FAZ-1 E7:LAD-4b
 contract-method	accelerator.UpdatePhase	E1:FAZ-2 E7:LAD-4b
@@ -95,7 +95,7 @@ contract-method	common.VoteByName	E1:AZ-4
 contract-method	common.VoteByProdAddress	
 contract-method	common.WithdrawQsr	E1:PI-5
 contract-method	htlc.AllowProxyUnlock	E1:HT-5 E7:LAD-5b
-contract-method	htlc.Create	E1:HT-1 E1:HT-10 E2:HT-2 E5:HT-2 E7:LAD-5b E12:HT-3
+contract-method	htlc.Create	E1:HT-1 E1:HT-10 E2:HT-2 E5:HT-2 E7:LAD-5b E7:S-1 E7:S-2 E12:HT-3
 contract-method	htlc.DenyProxyUnlock	E1:HT-5 E7:LAD-5b
 contract-method	htlc.Reclaim	E1:HT-11 E3:HT-7 E7:LAD-5b E12:HT-11 E12:HT-6
 contract-method	htlc.Unlock	E1:HT-10 E1:HT-8 E3:HT-5 E4:HT-9 E5:HT-4 E7:LAD-5b E12:HT-11
@@ -106,7 +106,7 @@ contract-method	liquidity.CollectReward	E7:LAD-2b
 contract-method	liquidity.Donate	
 contract-method	liquidity.Emergency	E7:LAD-2b
 contract-method	liquidity.Fund	E7:LAD-2b
-contract-method	liquidity.LiquidityStake	E7:LAD-2b
+contract-method	liquidity.LiquidityStake	E7:LAD-2b E7:S-1 E7:S-2
 contract-method	liquidity.NominateGuardians	E7:LAD-2b
 contract-method	liquidity.ProposeAdministrator	E7:LAD-2b
 contract-method	liquidity.SetAdditionalReward	E7:LAD-2b
@@ -405,7 +405,7 @@ rpc-method	LedgerApi.GetFrontierAccountBlock	E1:B-1 E1:B-2b
 rpc-method	LedgerApi.GetFrontierMomentum	SMOKE E1:B-1
 rpc-method	LedgerApi.GetMomentumBeforeTime	
 rpc-method	LedgerApi.GetMomentumByHash	
-rpc-method	LedgerApi.GetMomentumsByHeight	SMOKE E1:TestSporkEdge E1:TestSporkStagedEnforcement
+rpc-method	LedgerApi.GetMomentumsByHeight	SMOKE E1:TestSporkEdge E1:TestSporkLadderEnforcement E1:TestSporkStagedEnforcement
 rpc-method	LedgerApi.GetMomentumsByPage	SMOKE
 rpc-method	LedgerApi.GetUnconfirmedBlocksByAddress	E1:B-9
 rpc-method	LedgerApi.GetUnreceivedBlocksByAddress	E1:B-1
@@ -452,12 +452,12 @@ rpc-method	SwapApi.GetLegacyPillars	SMOKE
 rpc-method	TokenAPI.GetAll	SMOKE E1:TK-1
 rpc-method	TokenAPI.GetByOwner	E1:TK-1
 rpc-method	TokenAPI.GetByZts	E1:TK-1 E1:TK-10 E1:TK-3 E1:TK-4 E1:TK-5 E1:TK-7 E1:TK-8 E1:TK-9
-spork	AcceleratorSpork	
-spork	BridgeAndLiquiditySpork	
+spork	AcceleratorSpork	E7:S-1 E7:S-2
+spork	BridgeAndLiquiditySpork	E7:S-1 E7:S-2
 spork	DynamicPlasmaSpork	E7:S-1 E7:S-2 E7:S-5 E7:S-7
 spork	EmbeddedRefundSpork	E7:S-1 E7:S-2 E7:S-5
 spork	EpochRewardTermsSpork	E7:S-1 E7:S-2 E7:S-5 E7:S-7
-spork	HtlcSpork	
+spork	HtlcSpork	E7:S-1 E7:S-2
 spork	Libp2pSpork	E7:S-1 E7:S-2 E7:S-5
 spork	PtlcSpork	E7:S-1 E7:S-2 E7:S-5
 subscription	AccountBlocksByAddress	

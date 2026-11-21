@@ -1,0 +1,21 @@
+e2e: endpoints [http://localhost:37997], chain 69, start height 8, account indexes from 1512
+e2e: sporks enforced: [embedded-refund epoch-reward-terms ptlc]
+e2e: node v0.0.10-alphanet-739-gc5bba33, fast constants: false
+=== RUN   TestSporkLadderEnforcement
+e2e: endpoints [http://localhost:37997], chain 69, start height 18, account indexes from 2152
+e2e: sporks enforced: [embedded-refund epoch-reward-terms ptlc]
+e2e: node v0.0.10-alphanet-739-gc5bba33, fast constants: false
+=== RUN   TestSporkLadderEnforcement
+=== RUN   TestSporkLadderEnforcement/S-1_ladder_gated_methods_refused_before_enforcement
+=== RUN   TestSporkLadderEnforcement/S-2_accelerator_at_and_after_enforcement
+=== RUN   TestSporkLadderEnforcement/S-2_bridge_and_liquidity_at_enforcement
+=== RUN   TestSporkLadderEnforcement/S-2_htlc_at_and_after_enforcement
+--- PASS: TestSporkLadderEnforcement (566.34s)
+    --- PASS: TestSporkLadderEnforcement/S-1_ladder_gated_methods_refused_before_enforcement (0.03s)
+    --- PASS: TestSporkLadderEnforcement/S-2_accelerator_at_and_after_enforcement (229.93s)
+    --- PASS: TestSporkLadderEnforcement/S-2_bridge_and_liquidity_at_enforcement (130.54s)
+    --- PASS: TestSporkLadderEnforcement/S-2_htlc_at_and_after_enforcement (169.69s)
+PASS
+e2e: coverage file: open docs/test-results/2026-11-21-spork-ladder/coverage-ladder.tsv: no such file or directory
+FAIL	github.com/zenon-network/go-zenon/test/e2e	566.361s
+FAIL

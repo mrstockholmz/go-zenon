@@ -42,6 +42,15 @@ VARIANTS = {
     # The new sporks arrive one after another on a running network, for before/at/after cases.
     "staged": {"az": 0, "htlc": 0, "bridge-liq": 0, "libp2p": 20, "dynamic-plasma": 30,
                "ptlc": 60, "embedded-refund": 70, "epoch-reward-terms": 80},
+    # The legacy ladder arrives on a running network: every other variant
+    # enforces az, bridge-liq and htlc from height 0, which leaves no
+    # before/at/after for them. The later rungs stay at 0 (in force from
+    # genesis); libp2p and dynamic plasma keep their stock switch-over
+    # heights from the committed genesis, so the network starts the way
+    # procedure P4 rehearses it.
+    "ladder": {"az": 40, "bridge-liq": 55, "htlc": 70,
+               "libp2p": 20, "dynamic-plasma": 30,
+               "ptlc": 0, "embedded-refund": 0, "epoch-reward-terms": 0},
     # For the test build with fast constants (FAST=1 build-image.sh, procedure P11): every spork
     # from the start, and a genesis time of now. Epochs are counted from the genesis time; with
     # the committed time, which is long past, the reward contracts would first have to work
