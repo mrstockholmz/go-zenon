@@ -202,6 +202,7 @@ func TestSporkStagedEnforcement(t *testing.T) {
 			}
 		}
 		cover(t, "E7", "spork", ahead...)
+		cover(t, "E7", "verifier-rule", "momentum.version", "momentum.nextFusionPrice", "momentum.nextWorkPrice")
 		// Dynamic Plasma's consensus-visible gate pre-spork: version 1 and
 		// zero resource prices (verifier/momentum.go requires both).
 		for _, h := range []uint64{f.Height, f.Height - 1} {
@@ -243,6 +244,7 @@ func TestSporkStagedEnforcement(t *testing.T) {
 
 	t.Run("S-2_dynamic_plasma_at_enforcement", func(t *testing.T) {
 		cover(t, "E7", "spork", "DynamicPlasmaSpork")
+		cover(t, "E7", "verifier-rule", "momentum.version", "momentum.nextFusionPrice", "momentum.nextWorkPrice")
 		H := want["dynamic-plasma"]
 		boundary("dynamic-plasma", H, H+2)
 		// E7 semantic for Dynamic Plasma: momentum H is still produced by
